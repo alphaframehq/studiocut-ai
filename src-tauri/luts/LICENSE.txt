@@ -1,0 +1,12 @@
+StudioCut Identity, Warm and Cool LUT presets
+
+These original lookup-table transforms are generated deterministically from the
+formulas in src/finishing.rs. No third-party LUT content is included.
+
+To the extent possible under law, the authors dedicate these preset lookup-table
+values to the public domain under CC0 1.0 Universal. You may copy, modify,
+redistribute and use the generated .cube presets commercially without attribution.
+
+Legal instrument: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+No warranty is provided. This dedication covers the preset data, not the rest
+of the application source code.
