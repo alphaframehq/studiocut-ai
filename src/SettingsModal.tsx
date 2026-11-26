@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { X } from 'lucide-react';
-import { getEncoderPreference, getWhisperBinary, getWhisperModel, setEncoderPreference, setWhisperBinary, setWhisperModel, type ListedModel } from './preferences';
+import { getEncoderPreference, getStyleDna, getWhisperBinary, getWhisperModel, setEncoderPreference, setStyleDna, setWhisperBinary, setWhisperModel, type ListedModel, type StyleDNA } from './preferences';
 
 type Provider = 'gemini' | 'openai' | 'claude' | 'groq' | 'openrouter' | 'compatible' | 'ollama' | 'bedrock' | 'vertex';
 type LicenseStatus = { fingerprint: string; mode: string; licensed: boolean; license: { name: string; email: string; expiresAt: number | null } | null };
@@ -18,8 +18,8 @@ const providers: { id: Provider; label: string; defaultEndpoint: string; default
   { id: 'vertex', label: 'GCP Vertex AI', defaultEndpoint: '', defaultModel: 'gemini-2.0-flash', endpointLabel: 'https://aiplatform.googleapis.com/… endpoint per director docs' },
 ];
 
-type Tab = 'keys' | 'ai' | 'transcribe' | 'license';
-const tabs: [Tab, string][] = [['keys', 'API keys'], ['ai', 'AI & encoding'], ['transcribe', 'Transcription'], ['license', 'License']];
+type Tab = 'keys' | 'ai' | 'transcribe' | 'style' | 'license';
+const tabs: [Tab, string][] = [['keys', 'API keys'], ['ai', 'AI & encoding'], ['transcribe', 'Transcription'], ['style', 'My style'], ['license', 'License']];
 
 export function SettingsModal() {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -43,6 +43,8 @@ export function SettingsModal() {
   const [licenseBusy, setLicenseBusy] = useState(false);
   const [licenseMessage, setLicenseMessage] = useState('');
   const [licenseError, setLicenseError] = useState('');
+  const [styleDna, setStyleDnaState] = useState<StyleDNA>(getStyleDna);
+  const [styleSaved, setStyleSaved] = useState('');
   const keyInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -143,6 +145,17 @@ export function SettingsModal() {
           {localFilesNote && <small>{localFilesNote}</small>}
           <button className="button secondary" onClick={() => void checkWhisper()}>Check availability</button>
           <div role="status" aria-live="polite">{whisperStatus && <pre className="whisper-status">{whisperStatus}</pre>}</div>
+        </section>}
+        {tab === 'style' && <section aria-label="My style (Style DNA)">
+          <p className="settings-note">One saved look + pace for the whole studio. Export opens with this aspect and fill; captions open with this preset. Nothing here is sent to any provider.</p>
+          <label>Caption preset<select value={styleDna.captionPreset} onChange={e => setStyleDnaState({ ...styleDna, captionPreset: e.target.value as StyleDNA['captionPreset'] })}><option value="hormozi">Hormozi · bold punch</option><option value="minimal">Minimal · clean type</option><option value="documentary">Documentary · lower third</option><option value="neon">Neon · electric glow</option></select></label>
+          <label>Export aspect<select value={styleDna.aspect} onChange={e => setStyleDnaState({ ...styleDna, aspect: e.target.value as StyleDNA['aspect'] })}><option value="landscape">16:9 · Landscape</option><option value="vertical">9:16 · Vertical</option><option value="square">1:1 · Square</option></select></label>
+          <label>Frame fill<select value={styleDna.fill} onChange={e => setStyleDnaState({ ...styleDna, fill: e.target.value as StyleDNA['fill'] })}><option value="fit">Fit · bars added</option><option value="cover">Cover · fills frame, crops edges</option></select></label>
+          <label>Pace<select value={styleDna.pace} onChange={e => setStyleDnaState({ ...styleDna, pace: e.target.value as StyleDNA['pace'] })}><option value="preserve">Preserve original pacing</option><option value="tight">Tighter cuts with natural pauses</option><option value="documentary">Documentary with B-roll</option><option value="shortform">Short-form with kinetic captions</option></select></label>
+          <label>Intro style<select value={styleDna.introStyle} onChange={e => setStyleDnaState({ ...styleDna, introStyle: e.target.value as StyleDNA['introStyle'] })}><option value="hook-first">Hook first · strongest line opens</option><option value="cold-open">Cold open · scene first, no title</option><option value="title-card">Title card · name up front</option><option value="none">No intro treatment</option></select></label>
+          <label>Music mood<select value={styleDna.musicMood} onChange={e => setStyleDnaState({ ...styleDna, musicMood: e.target.value as StyleDNA['musicMood'] })}><option value="none">No music preference</option><option value="upbeat">Upbeat</option><option value="calm">Calm</option><option value="dramatic">Dramatic</option><option value="cinematic">Cinematic</option></select></label>
+          <button className="button primary" onClick={() => { setStyleDna(styleDna); setStyleSaved('Style saved. Export and captions will open with these choices.'); }}>Save my style</button>
+          <div role="status" aria-live="polite">{styleSaved}</div>
         </section>}
         {tab === 'license' && <section aria-label="License">
           {!isTauri() && <p className="settings-note">License status requires the desktop app.</p>}
