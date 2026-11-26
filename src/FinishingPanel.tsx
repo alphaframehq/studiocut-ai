@@ -9,9 +9,20 @@ import './finishing.css';
 export function FinishingPanel() {
   const { project, selected, frame, busy, replaceTracks } = useProject();
   const [error, setError] = useState('');
+  const [thumbnail, setThumbnail] = useState<string | null>(null);
+  const [thumbBusy, setThumbBusy] = useState(false);
   const track = project?.tracks.find(t => t.clips.some(c => c.id === selected));
   const clip = track?.clips.find(c => c.id === selected);
   const f = clip?.effects?.finishing ?? defaultFinishing();
+  async function grabThumbnail() {
+    if (!project || !clip || track?.kind !== 'video') return;
+    if (frame < clip.start || frame >= clip.start + clip.duration) { setError('Place the playhead inside the video clip to grab its frame.'); return; }
+    setError(''); setThumbBusy(true);
+    try {
+      const atSeconds = ((clip.sourceIn + (frame - clip.start) * f.speed) / project.settings.fps);
+      setThumbnail(await invoke<string>('extract_thumbnail', { projectId: project.id, revision: project.revision, clipId: clip.id, atSeconds }));
+    } catch (e) { setError(String(e)); } finally { setThumbBusy(false); }
+  }
   async function apply(patch: Partial<Finishing>, lut?: Lut | null) {
     if (!project || !clip || !track) return;
     setError('');
@@ -57,6 +68,7 @@ export function FinishingPanel() {
         <small>Auto-ducking listens to unmuted Voice tracks. No Voice track means no ducking.</small>
       </>}
     </fieldset>}
+    {clip && track?.kind === 'video' && <div className="thumbnail-box"><button className="button secondary" disabled={busy || thumbBusy} onClick={() => void grabThumbnail()}>{thumbBusy ? 'Grabbing frame…' : 'Grab thumbnail at playhead'}</button>{thumbnail && <><img src={thumbnail} alt="Thumbnail frame at the playhead" /><a className="button secondary" href={thumbnail} download={`${project?.name ?? 'thumbnail'}-thumb.png`}>Download PNG</a></>}<small>Pure frame grab — no grade or captions applied.</small></div>}
     {error && <p role="alert" className="error">{error}</p>}
   </section>;
 }
