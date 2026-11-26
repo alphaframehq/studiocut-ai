@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { X } from 'lucide-react';
-import { getEncoderPreference, getWhisperBinary, getWhisperModel, setEncoderPreference, setWhisperBinary, setWhisperModel } from './preferences';
+import { getEncoderPreference, getWhisperBinary, getWhisperModel, setEncoderPreference, setWhisperBinary, setWhisperModel, type ListedModel } from './preferences';
 
 type Provider = 'gemini' | 'openai' | 'claude' | 'groq' | 'openrouter' | 'compatible' | 'ollama' | 'bedrock' | 'vertex';
 type LicenseStatus = { fingerprint: string; mode: string; licensed: boolean; license: { name: string; email: string; expiresAt: number | null } | null };
@@ -36,6 +36,8 @@ export function SettingsModal() {
   const [whisperBinary, setWhisperBinaryState] = useState(getWhisperBinary);
   const [whisperModel, setWhisperModelState] = useState(getWhisperModel);
   const [whisperStatus, setWhisperStatus] = useState('');
+  const [localFiles, setLocalFiles] = useState<string[]>([]);
+  const [localFilesNote, setLocalFilesNote] = useState('');
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [licenseText, setLicenseText] = useState('');
   const [licenseBusy, setLicenseBusy] = useState(false);
@@ -53,6 +55,15 @@ export function SettingsModal() {
     setKeyMessage(''); setKeyError(''); setLicenseMessage(''); setLicenseError('');
     if (isTauri()) void invoke<LicenseStatus>('license_status').then(setLicense).catch(e => setLicenseError(String(e)));
   }, [open]);
+  const scanLocalModels = async (modelPath: string) => {
+    if (!isTauri()) return;
+    try {
+      const found = await invoke<ListedModel[]>('list_transcription_models', { request: { provider: 'local', apiKey: '', endpoint: '', modelPath } });
+      setLocalFiles(found.map(f => f.path).filter((f): f is string => !!f));
+      setLocalFilesNote(found.length ? `${found.length} model file${found.length === 1 ? '' : 's'} in this folder.` : 'No .bin files in this folder.');
+    } catch (e) { setLocalFilesNote(String(e)); }
+  };
+  useEffect(() => { if (open && tab === 'transcribe') void scanLocalModels(whisperModel); }, [open, tab]);
   const close = () => { dialog.current?.close(); setOpen(false); };
 
   const saveKey = async () => {
@@ -127,7 +138,9 @@ export function SettingsModal() {
         {tab === 'transcribe' && <section aria-label="Transcription setup">
           <p className="settings-note">Local transcription uses whisper.cpp (<code>whisper-cli</code>) with a GGML model file. See <strong>SETUP_BINARIES.md</strong> in the repository for placement per platform. Cloud transcription uses the key saved for its provider.</p>
           <label>whisper-cli path or command<input value={whisperBinary} onChange={e => { setWhisperBinaryState(e.target.value); setWhisperBinary(e.target.value); }} spellCheck={false} /></label>
-          <label>GGML model path (.bin)<input value={whisperModel} onChange={e => { setWhisperModelState(e.target.value); setWhisperModel(e.target.value); }} placeholder="e.g. C:\models\ggml-base.en.bin or ~/models/ggml-base.en.bin" spellCheck={false} /></label>
+          <label>GGML model path (.bin)<input list="settings-whisper-files" value={whisperModel} onChange={e => { setWhisperModelState(e.target.value); setWhisperModel(e.target.value); }} onBlur={() => void scanLocalModels(whisperModel)} placeholder="e.g. C:\models\ggml-base.en.bin or ~/models/ggml-base.en.bin" spellCheck={false} /></label>
+          <datalist id="settings-whisper-files">{localFiles.map(f => <option key={f} value={f} />)}</datalist>
+          {localFilesNote && <small>{localFilesNote}</small>}
           <button className="button secondary" onClick={() => void checkWhisper()}>Check availability</button>
           <div role="status" aria-live="polite">{whisperStatus && <pre className="whisper-status">{whisperStatus}</pre>}</div>
         </section>}
