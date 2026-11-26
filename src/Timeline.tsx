@@ -4,9 +4,10 @@ import { useProject } from './store';
 import { timelineEnd, type Clip, type Track } from './timeline';
 
 export function Timeline() {
-  const { project, frame, selected, playing, busy, history, edit, undo, seek } = useProject();
+  const { project, frame, selected, playing, busy, history, edit, undo, seek, addMarker, removeMarker } = useProject();
   const [razor, setRazor] = useState(false);
   const [zoom, setZoom] = useState(36);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<{ id: string; x: number; original: number; current: number; edge?: 'in' | 'out' } | null>(null);
   const dragRef = useRef(drag);
   dragRef.current = drag;
@@ -17,6 +18,7 @@ export function Timeline() {
       if (event.code === 'Space' && project && timelineEnd(project.tracks)) { event.preventDefault(); useProject.setState({ playing: !useProject.getState().playing }); }
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seek(frame + (event.key === 'ArrowLeft' ? -1 : 1)); }
       if (selected && event.key.toLowerCase() === 's') void edit({ type: 'split', clipId: selected, frame: Math.round(frame) });
+      if (event.key.toLowerCase() === 'm' && project) { event.preventDefault(); void addMarker(frame); }
       if (selected && event.key === 'Delete') void edit({ type: 'remove', clipId: selected });
     };
     window.addEventListener('keydown', key);
@@ -43,7 +45,34 @@ export function Timeline() {
   }
   function move(event: React.PointerEvent) {
     const d = dragRef.current;
-    if (d) setDrag({ ...d, current: d.original + Math.round((event.clientX - d.x) / zoom * fps) });
+    if (!d || !project) return;
+    let current = d.original + Math.round((event.clientX - d.x) / zoom * fps);
+    // Snap-to-edge: clip edges magnetise to other clips, the playhead and 0.
+    const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === d.id);
+    const points = new Set<number>([0, frame]);
+    for (const t of project.tracks) for (const c of t.clips) {
+      if (clip && (c.id === clip.id || (clip.linkId !== null && c.linkId === clip.linkId))) continue;
+      points.add(c.start);
+      points.add(c.start + c.duration);
+    }
+    const threshold = Math.max(2, Math.round(8 / zoom * fps));
+    const snap = (value: number) => {
+      for (const p of points) if (Math.abs(value - p) <= threshold) return p;
+      return value;
+    };
+    if (d.edge) current = snap(current);
+    else if (clip) {
+      const snappedStart = snap(current);
+      current = snappedStart !== current ? snappedStart : snap(current + clip.duration) - clip.duration;
+    }
+    setDrag({ ...d, current });
+  }
+  function zoomToFit() {
+    const el = scrollRef.current;
+    if (!el || !project) return;
+    const seconds = end / fps + 5;
+    const available = Math.max(200, el.clientWidth - 150);
+    setZoom(Math.min(120, Math.max(4, Math.floor(available / seconds))));
   }
   function finish() {
     const d = dragRef.current;
@@ -81,17 +110,20 @@ export function Timeline() {
       <button aria-label="Razor tool" aria-pressed={razor} onClick={() => setRazor(!razor)}><Scissors size={15} /> Razor</button>
       <button disabled={!clip || busy || (clip && isLocked(clip))} onClick={() => selected && void edit({ type: 'split', clipId: selected, frame: Math.round(frame) })}>Split at playhead</button>
       <button aria-label="Delete selected clip" disabled={!clip || busy || (clip && isLocked(clip))} onClick={() => selected && void edit({ type: 'remove', clipId: selected })}><Trash2 size={15} /></button>
+      <button disabled={busy || !end} onClick={zoomToFit}>Zoom to fit</button>
+      <button disabled={busy} onClick={() => void addMarker(frame)}>+ Marker</button>
       <button disabled={busy} onClick={() => void edit({ type: 'addTrack', kind: 'video' })}><Plus size={14} /> Video track</button>
       <button disabled={busy} onClick={() => void edit({ type: 'addTrack', kind: 'audio' })}><Plus size={14} /> Audio track</button>
       <label>Zoom<input aria-label="Timeline zoom" type="range" min="4" max="120" value={zoom} onChange={e => setZoom(Number(e.target.value))} /></label>
     </div>
     <div className="transport"><button aria-label={playing ? 'Pause preview' : 'Play preview'} disabled={!end || busy} onClick={() => { if (frame >= end) seek(0); useProject.setState({ playing: !playing }); }}>{playing ? <Pause size={16} /> : <Play size={16} />}</button><output aria-label="Playhead time">{(frame / fps).toFixed(2)}s / {(end / fps).toFixed(2)}s</output><label>Playhead frame<input aria-label="Playhead frame" type="number" min="0" max={end} value={Math.round(frame)} onChange={e => seek(Math.min(end, Number(e.target.value)))} /></label><span>Audio-master clock · {fps} fps</span></div>
-    <div className="timeline-scroll"><div className="timeline-canvas" style={{ width: width + 150 }}>
-      <div className="timeline-ruler"><div className="ruler-label">TRACKS</div><div className="ruler" style={{ width }} onClick={event => seek(Math.min(end, (event.clientX - event.currentTarget.getBoundingClientRect().left) / zoom * fps))}>{Array.from({ length: Math.ceil(width / (zoom * 5)) }, (_, i) => <span key={i} style={{ left: i * zoom * 5 }}>{i * 5}s</span>)}</div></div>
+    <div className="marker-row" aria-label="Timeline markers"><span>MARKERS</span>{project.markers.map(m => <span key={m.id} className="marker-chip"><button onClick={() => seek(m.frame)} title={`Jump to ${m.label}`}>{m.label} · {(m.frame / fps).toFixed(2)}s</button><button aria-label={`Delete ${m.label}`} onClick={() => void removeMarker(m.id)}>×</button></span>)}{!project.markers.length && <span>No markers yet — press M at the playhead, or use + Marker.</span>}</div>
+    <div className="timeline-scroll" ref={scrollRef}><div className="timeline-canvas" style={{ width: width + 150 }}>
+      <div className="timeline-ruler"><div className="ruler-label">TRACKS</div><div className="ruler" style={{ width }} onClick={event => seek(Math.min(end, (event.clientX - event.currentTarget.getBoundingClientRect().left) / zoom * fps))}>{Array.from({ length: Math.ceil(width / (zoom * 5)) }, (_, i) => <span key={i} style={{ left: i * zoom * 5 }}>{i * 5}s</span>)}{project.markers.map(m => <span key={m.id} className="marker-tick" style={{ left: m.frame / fps * zoom }} title={m.label} />)}</div></div>
       {project.tracks.map(row)}
       {!project.tracks.length && <p className="timeline-empty">Add media from the library to create linked video and audio tracks.</p>}
     </div></div>
     {clip && <div className="clip-inspector" key={`${clip.id}-${project.revision}`}><strong>Selected clip {clip.linkId ? '· linked A/V' : ''}</strong><label>Start frame<input aria-label="Clip start frame" type="number" defaultValue={clip.start} disabled={busy || isLocked(clip)} onBlur={e => { const start = Number(e.target.value); if (start !== clip.start) void edit({ type: 'move', clipId: clip.id, start }); }} /></label><label>Trim in frame<input aria-label="Clip trim in frame" type="number" defaultValue={clip.start} disabled={busy || isLocked(clip)} onBlur={e => { const frame = Number(e.target.value); if (frame !== clip.start) void edit({ type: 'trim', clipId: clip.id, edge: 'in', frame }); }} /></label><label>Trim out frame<input aria-label="Clip trim out frame" type="number" defaultValue={clip.start + clip.duration} disabled={busy || isLocked(clip)} onBlur={e => { const frame = Number(e.target.value); if (frame !== clip.start + clip.duration) void edit({ type: 'trim', clipId: clip.id, edge: 'out', frame }); }} /></label><span>Source in: {clip.sourceIn} · Duration: {clip.duration} frames</span></div>}
-    <p className="timeline-help">Drag clips to move · Drag edges to trim · S to split · Space to play · Ctrl/⌘ Z to undo · 50 edits per session</p>
+    <p className="timeline-help">Drag clips to move · Drag edges to trim · S to split · M to add a marker · Space to play · Ctrl/⌘ Z to undo · 50 edits per session</p>
   </section>;
 }

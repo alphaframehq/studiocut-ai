@@ -12,6 +12,35 @@ use uuid::Uuid;
 
 const MAX_AUDIO: u64 = 20_000_000;
 const MAX_JSON: u64 = 4_000_000;
+const MAX_MODELS_JSON: u64 = 2_000_000;
+
+/// Models the provider is known to return with word/segment timestamps.
+/// Anything else is listed but flagged: transcribing with it fails loudly
+/// (see `validate`) instead of inventing timings.
+const RECOMMENDED_MODELS: [&str; 4] = [
+    "whisper-1",
+    "whisper-large-v3",
+    "distil-whisper-large-v3-en",
+    "openai/whisper-1",
+];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelsRequest {
+    pub provider: String,
+    pub api_key: String,
+    pub endpoint: String,
+    pub model_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListedModel {
+    pub id: String,
+    pub recommended: bool,
+    /// Full filesystem path for local `.bin` files; `None` for cloud models.
+    pub path: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -254,6 +283,148 @@ pub fn cloud_endpoint(options: &TranscriptionOptions) -> Result<reqwest::Url, St
         );
     }
     Ok(url)
+}
+
+pub fn models_endpoint(provider: &str, endpoint: &str) -> Result<reqwest::Url, String> {
+    let raw = match provider {
+        "openai" => "https://api.openai.com/v1/models".to_string(),
+        "groq" => "https://api.groq.com/openai/v1/models".to_string(),
+        "openrouter" => "https://openrouter.ai/api/v1/models".to_string(),
+        "openaicompatible" => {
+            let trimmed = endpoint.trim_end_matches('/');
+            let base = trimmed.strip_suffix("/audio/transcriptions").ok_or(
+                "Enter the full transcription endpoint URL ending in /audio/transcriptions",
+            )?;
+            format!("{base}/models")
+        }
+        _ => return Err("Unknown transcription provider".into()),
+    };
+    let url =
+        reqwest::Url::parse(&raw).map_err(|_| "Enter a complete HTTPS models endpoint URL")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "Transcription endpoints must use HTTPS without URL credentials, query, or fragment"
+                .into(),
+        );
+    }
+    Ok(url)
+}
+
+/// Keep only models that can plausibly transcribe: a whisper/transcription
+/// id, or — on OpenRouter — an audio input modality. Alphabetical, max 100.
+pub fn filter_models(value: &Value, provider: &str) -> Vec<ListedModel> {
+    let mut models: Vec<ListedModel> = value["data"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item["id"].as_str()?.to_string();
+                    let lower = id.to_lowercase();
+                    let audio_capable = item["input_modalities"]
+                        .as_array()
+                        .is_some_and(|m| m.iter().any(|v| v.as_str() == Some("audio")));
+                    if lower.contains("whisper")
+                        || lower.contains("transcri")
+                        || (provider == "openrouter" && audio_capable)
+                    {
+                        Some(ListedModel {
+                            recommended: RECOMMENDED_MODELS.contains(&id.as_str()),
+                            id,
+                            path: None,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.truncate(100);
+    models
+}
+
+/// Scan the folder next to the configured local model for `.bin` files.
+/// No downloads: only files already on disk are listed.
+pub fn scan_local_models(model_path: &str) -> Result<Vec<ListedModel>, String> {
+    if model_path.trim().is_empty() {
+        return Err("Set a local model path first to scan its folder".into());
+    }
+    let path = Path::new(model_path);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("Local model path has no folder to scan")?;
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut files: Vec<ListedModel> = vec![];
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file = entry.path();
+        if file
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("bin"))
+            && file.is_file()
+        {
+            files.push(ListedModel {
+                id: entry.file_name().to_string_lossy().into_owned(),
+                // Local whisper.cpp always emits timestamps when it works;
+                // a bad file fails loudly at transcribe time instead.
+                recommended: true,
+                path: Some(file.to_string_lossy().into_owned()),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(files)
+}
+
+pub fn list_models(request: &ModelsRequest) -> Result<Vec<ListedModel>, String> {
+    if request.provider == "local" {
+        return scan_local_models(&request.model_path);
+    }
+    if request.api_key.trim().is_empty() || request.api_key.len() > 4096 {
+        return Err("Enter an API key first".into());
+    }
+    let url = models_endpoint(&request.provider, &request.endpoint)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Cannot initialize secure transcription client")?;
+    let response = client
+        .get(url)
+        .bearer_auth(request.api_key.trim())
+        .send()
+        .map_err(|_| {
+            "Model list request failed. Check the endpoint, network, and TLS certificate; no automatic retry was made"
+        })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Model list request returned HTTP {}. Check the API key and provider",
+            response.status().as_u16()
+        ));
+    }
+    let mut data = Vec::new();
+    response
+        .take(MAX_MODELS_JSON + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "Failed reading model list response")?;
+    if data.len() as u64 > MAX_MODELS_JSON {
+        return Err("Model list exceeds the 2 MB response limit".into());
+    }
+    let value: Value =
+        serde_json::from_slice(&data).map_err(|_| "Model list returned invalid JSON")?;
+    Ok(filter_models(&value, &request.provider))
 }
 
 pub fn cloud_request(
@@ -563,6 +734,134 @@ mod tests {
             local_available("nonexistent-whisper-binary", "/nonexistent-model")
                 .unwrap_err()
                 .contains("unavailable")
+        );
+    }
+    #[test]
+    fn models_endpoint_derivation_and_https_rules() {
+        assert_eq!(
+            models_endpoint("openai", "").unwrap().as_str(),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("groq", "").unwrap().as_str(),
+            "https://api.groq.com/openai/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("openrouter", "").unwrap().as_str(),
+            "https://openrouter.ai/api/v1/models"
+        );
+        assert_eq!(
+            models_endpoint(
+                "openaicompatible",
+                "https://host.example/v1/audio/transcriptions"
+            )
+            .unwrap()
+            .as_str(),
+            "https://host.example/v1/models"
+        );
+        assert_eq!(
+            models_endpoint(
+                "openaicompatible",
+                "https://host.example/v1/audio/transcriptions/"
+            )
+            .unwrap()
+            .as_str(),
+            "https://host.example/v1/models"
+        );
+        assert!(models_endpoint("openaicompatible", "https://host.example/v1/models").is_err());
+        assert!(models_endpoint(
+            "openaicompatible",
+            "http://host.example/v1/audio/transcriptions"
+        )
+        .is_err());
+        assert!(models_endpoint(
+            "openaicompatible",
+            "https://key@host.example/v1/audio/transcriptions"
+        )
+        .is_err());
+        assert!(models_endpoint("unknown", "").is_err());
+    }
+    #[test]
+    fn model_filtering_keeps_whisper_and_audio_models() {
+        let models = filter_models(
+            &json!({"data":[
+                {"id":"gpt-4o"},
+                {"id":"whisper-large-v3"},
+                {"id":"openai/whisper-1"},
+                {"id":"distil-whisper-large-v3-en"},
+                {"id":"some-transcription-model"},
+                {"id":"meta-llama/llama-3.3-70b-instruct","input_modalities":["text"]},
+                {"id":"qwen/qwen2-audio-7b-instruct","input_modalities":["text","audio"]},
+                {"id":"no-id-here"}
+            ]}),
+            "openrouter",
+        );
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "distil-whisper-large-v3-en",
+                "openai/whisper-1",
+                "qwen/qwen2-audio-7b-instruct",
+                "some-transcription-model",
+                "whisper-large-v3",
+            ]
+        );
+        assert!(models
+            .iter()
+            .filter(|m| m.recommended)
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>()
+            .eq(&[
+                "distil-whisper-large-v3-en",
+                "openai/whisper-1",
+                "whisper-large-v3"
+            ]));
+        assert!(
+            !models
+                .iter()
+                .find(|m| m.id == "some-transcription-model")
+                .unwrap()
+                .recommended
+        );
+        // Non-OpenRouter providers do not get the audio-modality fallback.
+        assert!(filter_models(
+            &json!({"data":[{"id":"qwen2-audio","input_modalities":["audio"]}]}),
+            "openai"
+        )
+        .is_empty());
+        // Alphabetical, capped at 100.
+        let many: Vec<Value> = (0..150)
+            .map(|n| json!({"id": format!("whisper-model-{n:03}")}))
+            .collect();
+        let capped = filter_models(&json!({"data": many}), "groq");
+        assert_eq!(capped.len(), 100);
+        assert_eq!(capped[0].id, "whisper-model-000");
+        assert_eq!(capped[99].id, "whisper-model-099");
+    }
+    #[test]
+    fn local_model_scan_lists_bin_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "ggml-base.en.bin",
+            "ggml-small.bin",
+            "notes.txt",
+            "model.BIN",
+        ] {
+            fs::write(dir.path().join(name), b"fake").unwrap();
+        }
+        let found =
+            scan_local_models(dir.path().join("ggml-base.en.bin").to_str().unwrap()).unwrap();
+        assert_eq!(
+            found.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["ggml-base.en.bin", "ggml-small.bin", "model.BIN"]
+        );
+        assert!(found.iter().all(|m| m.recommended && m.path.is_some()));
+        assert!(scan_local_models("").is_err());
+        assert!(
+            scan_local_models(dir.path().join("missing/ggml.bin").to_str().unwrap())
+                .unwrap()
+                .is_empty()
         );
     }
 }

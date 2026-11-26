@@ -9,6 +9,32 @@ pub struct ExportSettings {
     pub height: u32,
     pub fps: u32,
     pub encoder: String,
+    /// Canvas shape: `landscape` (16:9), `vertical` (9:16), `square` (1:1).
+    /// Defaults keep old payloads (and old clients) working.
+    #[serde(default = "default_aspect")]
+    pub aspect: String,
+    /// `fit` letterboxes/pillarbars into the canvas; `cover` fills the
+    /// frame edge to edge and center-crops the overflow.
+    #[serde(default = "default_fill")]
+    pub fill: String,
+}
+fn default_aspect() -> String {
+    "landscape".into()
+}
+fn default_fill() -> String {
+    "fit".into()
+}
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            container: "mp4".into(),
+            height: 1080,
+            fps: 30,
+            encoder: "auto".into(),
+            aspect: default_aspect(),
+            fill: default_fill(),
+        }
+    }
 }
 impl ExportSettings {
     pub fn validate(&self) -> Result<(), String> {
@@ -24,13 +50,27 @@ impl ExportSettings {
                 "h264_qsv",
             ]
             .contains(&self.encoder.as_str())
+            || !["landscape", "vertical", "square"].contains(&self.aspect.as_str())
+            || !["fit", "cover"].contains(&self.fill.as_str())
         {
             return Err("Unsupported export settings".into());
         }
         Ok(())
     }
     pub fn width(&self) -> u32 {
-        self.height * 16 / 9
+        match self.aspect.as_str() {
+            "vertical" => {
+                // 1080 -> 607.5 -> 608; 2160 -> 1215 -> 1216 (even for yuv420p).
+                let w = (self.height as f64 * 9.0 / 16.0).round() as u32;
+                if w % 2 == 1 {
+                    w + 1
+                } else {
+                    w
+                }
+            }
+            "square" => self.height,
+            _ => self.height * 16 / 9,
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -170,8 +210,14 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
     let fps = project.settings.fps as f64;
     let duration = end as f64 / fps;
     let (w, h, r) = (settings.width(), settings.height, settings.fps);
-    let ratio =
-        (w as f64 / project.settings.width as f64).min(h as f64 / project.settings.height as f64);
+    // `fit` shrinks the project canvas inside the export canvas (bars);
+    // `cover` grows it until it fills the canvas, then center-crops.
+    let cover = settings.fill == "cover";
+    let ratio = if cover {
+        (w as f64 / project.settings.width as f64).max(h as f64 / project.settings.height as f64)
+    } else {
+        (w as f64 / project.settings.width as f64).min(h as f64 / project.settings.height as f64)
+    };
     let canvas_w = ((project.settings.width as f64 * ratio / 2.0).floor() as u32 * 2).max(2);
     let canvas_h = ((project.settings.height as f64 * ratio / 2.0).floor() as u32 * 2).max(2);
     let active_clips: usize = project
@@ -232,7 +278,12 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
             let time = format!("(t*{}+{})", number(fps * f.speed), clip.source_in);
             if track.kind == "video" {
                 let stream = asset.video_stream.ok_or("Video stream missing")?;
-                let mut chain = format!("[{input}:{stream}]trim=start={}:duration={},setpts=(PTS-STARTPTS)/{},fps={r},scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1",number(if asset.kind == "image" {0.0} else {clip.source_in as f64/fps}),number(length*f.speed),number(f.speed));
+                let fit = if cover {
+                    format!("crop={w}:{h}:(iw-ow)/2:(ih-oh)/2")
+                } else {
+                    format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
+                };
+                let mut chain = format!("[{input}:{stream}]trim=start={}:duration={},setpts=(PTS-STARTPTS)/{},fps={r},scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2,{fit},setsar=1",number(if asset.kind == "image" {0.0} else {clip.source_in as f64/fps}),number(length*f.speed),number(f.speed));
                 if let Some(cube) = &f.cube {
                     finishing::validate_cube(cube)?;
                     let name = format!("lut{input}.cube");
@@ -413,4 +464,46 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
     }
     out.graph = nodes.join(";\n");
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn settings(aspect: &str, fill: &str, height: u32) -> ExportSettings {
+        ExportSettings {
+            container: "mp4".into(),
+            height,
+            fps: 30,
+            encoder: "libx264".into(),
+            aspect: aspect.into(),
+            fill: fill.into(),
+        }
+    }
+    #[test]
+    fn export_width_is_derived_per_aspect_and_stays_even() {
+        assert_eq!(settings("landscape", "fit", 1080).width(), 1920);
+        assert_eq!(settings("landscape", "fit", 2160).width(), 3840);
+        // 1080 * 9/16 = 607.5 -> 608; 2160 * 9/16 = 1215 -> 1216.
+        assert_eq!(settings("vertical", "fit", 1080).width(), 608);
+        assert_eq!(settings("vertical", "cover", 2160).width(), 1216);
+        assert_eq!(settings("square", "fit", 1080).width(), 1080);
+        assert_eq!(settings("square", "cover", 2160).width(), 2160);
+    }
+    #[test]
+    fn export_settings_reject_unknown_aspect_or_fill() {
+        assert!(settings("landscape", "fit", 1080).validate().is_ok());
+        assert!(settings("vertical", "cover", 2160).validate().is_ok());
+        assert!(settings("portrait", "fit", 1080).validate().is_err());
+        assert!(settings("landscape", "stretch", 1080).validate().is_err());
+        assert!(settings("landscape", "fit", 720).validate().is_err());
+    }
+    #[test]
+    fn old_export_payloads_without_aspect_still_parse() {
+        let parsed: ExportSettings =
+            serde_json::from_str(r#"{"container":"mp4","height":1080,"fps":30,"encoder":"auto"}"#)
+                .unwrap();
+        assert_eq!(parsed.aspect, "landscape");
+        assert_eq!(parsed.fill, "fit");
+        assert_eq!(parsed.width(), 1920);
+    }
 }

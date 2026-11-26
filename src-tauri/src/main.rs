@@ -9,7 +9,24 @@ use tauri_plugin_dialog::DialogExt;
 struct Workspace(
     Mutex<Option<Project>>,
     Mutex<studiocut_ai::timeline::History>,
+    // Remembered project file: set by open/save so autosave can write
+    // without opening a dialog. `None` until the project is saved once.
+    Mutex<Option<std::path::PathBuf>>,
 );
+
+#[derive(serde::Serialize)]
+struct OpenResult {
+    project: Project,
+    path: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryInfo {
+    backup_path: String,
+    backup_modified_ms: u64,
+    project_modified_ms: u64,
+}
 
 fn analysis_snapshot(
     state: &State<Workspace>,
@@ -172,6 +189,15 @@ async fn transcription_status(binary: String, model: String) -> Result<String, S
 }
 
 #[tauri::command]
+async fn list_transcription_models(
+    request: studiocut_ai::transcription::ModelsRequest,
+) -> Result<Vec<studiocut_ai::transcription::ListedModel>, String> {
+    tauri::async_runtime::spawn_blocking(move || studiocut_ai::transcription::list_models(&request))
+        .await
+        .map_err(|_| "Model list task failed".to_string())?
+}
+
+#[tauri::command]
 async fn transcribe_clip(
     state: State<'_, Workspace>,
     project_id: uuid::Uuid,
@@ -264,6 +290,131 @@ fn edit_timeline(
 }
 
 #[tauri::command]
+fn set_markers(
+    state: State<Workspace>,
+    markers: Vec<studiocut_ai::Marker>,
+) -> Result<Project, String> {
+    let mut current = state.0.lock().map_err(|e| e.to_string())?;
+    let project = current.as_ref().ok_or("No project is open")?;
+    let mut next = project.clone();
+    next.markers = markers;
+    next.revision = next.revision.checked_add(1).ok_or("Revision overflow")?;
+    next.validate()?;
+    *current = Some(next.clone());
+    Ok(next)
+}
+
+#[tauri::command]
+fn rename_asset(
+    state: State<Workspace>,
+    asset_id: uuid::Uuid,
+    name: String,
+) -> Result<Project, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.encode_utf16().count() > 120 || name.contains('\0') {
+        return Err("Asset name must be 1–120 characters".into());
+    }
+    let mut current = state.0.lock().map_err(|e| e.to_string())?;
+    let project = current.as_ref().ok_or("No project is open")?;
+    let mut next = project.clone();
+    let asset = next
+        .assets
+        .iter_mut()
+        .find(|a| a.id == asset_id)
+        .ok_or("Media not found")?;
+    asset.name = name;
+    next.revision = next.revision.checked_add(1).ok_or("Revision overflow")?;
+    next.validate()?;
+    *current = Some(next.clone());
+    Ok(next)
+}
+
+#[tauri::command]
+fn remove_asset(state: State<Workspace>, asset_id: uuid::Uuid) -> Result<Project, String> {
+    let mut current = state.0.lock().map_err(|e| e.to_string())?;
+    let project = current.as_ref().ok_or("No project is open")?;
+    if project
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .any(|c| c.asset_id == asset_id)
+    {
+        return Err("Remove the clips that use this media first".into());
+    }
+    let mut next = project.clone();
+    let before = next.assets.len();
+    next.assets.retain(|a| a.id != asset_id);
+    if next.assets.len() == before {
+        return Err("Media not found".into());
+    }
+    next.revision = next.revision.checked_add(1).ok_or("Revision overflow")?;
+    next.validate()?;
+    *current = Some(next.clone());
+    Ok(next)
+}
+
+#[tauri::command]
+async fn relink_asset(
+    app: tauri::AppHandle,
+    state: State<'_, Workspace>,
+    asset_id: uuid::Uuid,
+    path: String,
+) -> Result<Project, String> {
+    use tauri::Manager;
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("media");
+    let probed = tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::media::import_media(&root, std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let mut current = state.0.lock().map_err(|e| e.to_string())?;
+    let project = current.as_ref().ok_or("No project is open")?;
+    let mut next = project.clone();
+    let asset = next
+        .assets
+        .iter_mut()
+        .find(|a| a.id == asset_id)
+        .ok_or("Media not found")?;
+    // Keep the original id (clips reference it) and import time; take
+    // everything else from the fresh probe.
+    let old_id = asset.id;
+    let old_created = asset.created_at;
+    *asset = probed;
+    asset.id = old_id;
+    asset.created_at = old_created;
+    next.revision = next.revision.checked_add(1).ok_or("Revision overflow")?;
+    next.validate()?;
+    *current = Some(next.clone());
+    Ok(next)
+}
+
+#[tauri::command]
+async fn media_missing(state: State<'_, Workspace>) -> Result<Vec<uuid::Uuid>, String> {
+    let assets = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .map(|p| p.assets.clone())
+        .unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut missing = vec![];
+        for asset in assets {
+            if studiocut_ai::media::verified_source(&asset).is_err() {
+                missing.push(asset.id);
+            }
+        }
+        Ok(missing)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn playback_source(
     app: tauri::AppHandle,
     state: State<Workspace>,
@@ -315,6 +466,8 @@ fn create_project(
     let project = create(name, width, height, fps)?;
     *state.0.lock().map_err(|e| e.to_string())? = Some(project.clone());
     *state.1.lock().map_err(|e| e.to_string())? = Default::default();
+    // A new project has no file yet: never autosave over a previous one.
+    *state.2.lock().map_err(|e| e.to_string())? = None;
     Ok(project)
 }
 
@@ -322,9 +475,9 @@ fn create_project(
 async fn open_project(
     app: tauri::AppHandle,
     state: State<'_, Workspace>,
-) -> Result<Option<Project>, String> {
-    let project =
-        tauri::async_runtime::spawn_blocking(move || -> Result<Option<Project>, String> {
+) -> Result<Option<OpenResult>, String> {
+    let opened = tauri::async_runtime::spawn_blocking(
+        move || -> Result<Option<(Project, std::path::PathBuf)>, String> {
             let Some(selected) = app
                 .dialog()
                 .file()
@@ -334,14 +487,35 @@ async fn open_project(
                 return Ok(None);
             };
             let path = selected.into_path().map_err(|e| e.to_string())?;
-            load_project(&path).map(Some)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-    if let Some(ref project) = project {
+            load_project(&path).map(|p| Some((p, path)))
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+    if let Some((project, path)) = opened {
         *state.0.lock().map_err(|e| e.to_string())? = Some(project.clone());
         *state.1.lock().map_err(|e| e.to_string())? = Default::default();
+        *state.2.lock().map_err(|e| e.to_string())? = Some(path.clone());
+        return Ok(Some(OpenResult {
+            project,
+            path: path.to_string_lossy().into_owned(),
+        }));
     }
+    Ok(None)
+}
+
+#[tauri::command]
+async fn open_project_path(state: State<'_, Workspace>, path: String) -> Result<Project, String> {
+    let path = std::path::PathBuf::from(path);
+    let project = {
+        let load_path = path.clone();
+        tauri::async_runtime::spawn_blocking(move || load_project(&load_path))
+            .await
+            .map_err(|e| e.to_string())??
+    };
+    *state.0.lock().map_err(|e| e.to_string())? = Some(project.clone());
+    *state.1.lock().map_err(|e| e.to_string())? = Default::default();
+    *state.2.lock().map_err(|e| e.to_string())? = Some(path);
     Ok(project)
 }
 
@@ -356,7 +530,7 @@ async fn save_project(
         .map_err(|e| e.to_string())?
         .clone()
         .ok_or("No project is open")?;
-    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
+    let saved = tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
         let Some(selected) = app
             .dialog()
             .file()
@@ -369,6 +543,161 @@ async fn save_project(
         let path = selected.into_path().map_err(|e| e.to_string())?;
         save(&project, &path)?;
         Ok(Some(path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if let Some(ref path) = saved {
+        // Remember the file for autosave; a successful manual save makes
+        // any crash-recovery backup obsolete.
+        *state.2.lock().map_err(|e| e.to_string())? = Some(std::path::PathBuf::from(path));
+        let _ = std::fs::remove_file(studiocut_ai::autosave_path(std::path::Path::new(path)));
+    }
+    Ok(saved)
+}
+
+/// Silent save to the remembered path. Returns `None` when the project has
+/// never been saved (frontend falls back to the dialog save). Writes the
+/// crash-recovery backup first, then the real file.
+#[tauri::command]
+async fn save_project_silent(state: State<'_, Workspace>) -> Result<Option<String>, String> {
+    let (project, path) = {
+        let project = state
+            .0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or("No project is open")?;
+        let path = state.2.lock().map_err(|e| e.to_string())?.clone();
+        (project, path)
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let saved = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let backup = studiocut_ai::autosave_path(&path);
+        let _ = save(&project, &backup);
+        save(&project, &path)?;
+        let _ = std::fs::remove_file(&backup);
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(Some(saved))
+}
+
+#[tauri::command]
+fn check_recovery(path: String) -> Result<Option<RecoveryInfo>, String> {
+    let path = std::path::PathBuf::from(path);
+    let backup = studiocut_ai::autosave_path(&path);
+    let (Ok(backup_meta), Ok(project_meta)) =
+        (std::fs::metadata(&backup), std::fs::metadata(&path))
+    else {
+        return Ok(None);
+    };
+    let (Ok(backup_mtime), Ok(project_mtime)) = (backup_meta.modified(), project_meta.modified())
+    else {
+        return Ok(None);
+    };
+    let to_ms = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    if to_ms(backup_mtime) > to_ms(project_mtime) {
+        Ok(Some(RecoveryInfo {
+            backup_path: backup.to_string_lossy().into_owned(),
+            backup_modified_ms: to_ms(backup_mtime),
+            project_modified_ms: to_ms(project_mtime),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn recover_project(state: State<'_, Workspace>, path: String) -> Result<Project, String> {
+    let path = std::path::PathBuf::from(path);
+    let backup = studiocut_ai::autosave_path(&path);
+    let project = tauri::async_runtime::spawn_blocking(move || load_project(&backup))
+        .await
+        .map_err(|e| e.to_string())??;
+    *state.0.lock().map_err(|e| e.to_string())? = Some(project.clone());
+    *state.1.lock().map_err(|e| e.to_string())? = Default::default();
+    // Remember the ORIGINAL path: the next save overwrites it, and the
+    // backup is deleted then.
+    *state.2.lock().map_err(|e| e.to_string())? = Some(path);
+    Ok(project)
+}
+
+#[tauri::command]
+fn discard_recovery(path: String) -> Result<(), String> {
+    let backup = studiocut_ai::autosave_path(std::path::Path::new(&path));
+    if backup.exists() {
+        std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupStatus {
+    ffmpeg: bool,
+    ffprobe: bool,
+    whisper_cli: bool,
+    whisper_model: bool,
+    detail: String,
+}
+
+fn tool_runs(command: &str) -> bool {
+    std::process::Command::new(command)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// First-run check: are the external tools the editor needs actually
+/// installed? Mirrors the lib's resolution (FFMPEG_PATH/FFPROBE_PATH win,
+/// otherwise the bare name on PATH). No keys, no network, no downloads.
+#[tauri::command]
+async fn setup_status(binary: String, model: String) -> Result<SetupStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let ffmpeg = std::env::var("FFMPEG_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map_or_else(|| tool_runs("ffmpeg"), |p| tool_runs(&p));
+        let ffprobe = std::env::var("FFPROBE_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map_or_else(|| tool_runs("ffprobe"), |p| tool_runs(&p));
+        let whisper_cli = !binary.trim().is_empty() && tool_runs(binary.trim());
+        let whisper_model =
+            !model.trim().is_empty() && std::path::Path::new(model.trim()).is_file();
+        let mut missing: Vec<&str> = vec![];
+        if !ffmpeg {
+            missing.push("FFmpeg");
+        }
+        if !ffprobe {
+            missing.push("FFprobe");
+        }
+        if !whisper_cli {
+            missing.push("whisper-cli");
+        }
+        if !whisper_model {
+            missing.push("whisper model file");
+        }
+        Ok(SetupStatus {
+            ffmpeg,
+            ffprobe,
+            whisper_cli,
+            whisper_model,
+            detail: if missing.is_empty() {
+                "All tools found.".into()
+            } else {
+                format!("Missing: {}.", missing.join(", "))
+            },
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -553,15 +882,27 @@ fn main() {
             director_apply,
             create_project,
             open_project,
+            open_project_path,
             save_project,
+            save_project_silent,
+            check_recovery,
+            recover_project,
+            discard_recovery,
+            setup_status,
             import_media,
             media_preview,
+            media_missing,
+            rename_asset,
+            remove_asset,
+            relink_asset,
+            set_markers,
             edit_timeline,
             playback_source,
             audio_chunk,
             detect_silence,
             ripple_delete,
             transcription_status,
+            list_transcription_models,
             transcribe_clip,
             add_captions,
             license_status,

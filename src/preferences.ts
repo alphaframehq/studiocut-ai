@@ -73,3 +73,75 @@ export function getWhisperModel(): string {
 export function setWhisperModel(model: string): void {
   write(WHISPER_MODEL_KEY, model);
 }
+
+// --- Transcription models (Phase 2d) -------------------------------------
+// Per-provider selected cloud model, e.g. groq -> whisper-large-v3.
+// API keys are never stored here — only the model id.
+export type ListedModel = { id: string; recommended: boolean; path: string | null };
+
+const MODEL_KEY_PREFIX = 'studiocut.transcriptionModel.';
+const MODELS_CACHE_PREFIX = 'studiocut.transcriptionModels.';
+const MODELS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+export function getTranscriptionModel(provider: string): string | null {
+  return read(`${MODEL_KEY_PREFIX}${provider}`);
+}
+
+export function setTranscriptionModel(provider: string, model: string): void {
+  write(`${MODEL_KEY_PREFIX}${provider}`, model);
+}
+
+export function getCachedTranscriptionModels(
+  provider: string,
+): { models: ListedModel[]; fetchedAt: number } | null {
+  const raw = read(`${MODELS_CACHE_PREFIX}${provider}`);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { fetchedAt: number; models: ListedModel[] };
+    if (
+      typeof parsed.fetchedAt !== 'number' ||
+      !Array.isArray(parsed.models) ||
+      Date.now() - parsed.fetchedAt > MODELS_CACHE_TTL_MS
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function setCachedTranscriptionModels(provider: string, models: ListedModel[]): void {
+  write(
+    `${MODELS_CACHE_PREFIX}${provider}`,
+    JSON.stringify({ fetchedAt: Date.now(), models }),
+  );
+}
+
+// --- Recent projects (Phase 2a) ------------------------------------------
+export type RecentProject = { path: string; name: string; openedAt: number };
+
+const RECENT_KEY = 'studiocut.recentProjects';
+const RECENT_MAX = 8;
+
+export function getRecentProjects(): RecentProject[] {
+  const raw = read(RECENT_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as RecentProject[];
+    return Array.isArray(parsed)
+      ? parsed.filter(p => typeof p?.path === 'string' && typeof p?.name === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function addRecentProject(path: string, name: string): RecentProject[] {
+  const next = [
+    { path, name, openedAt: Date.now() },
+    ...getRecentProjects().filter(p => p.path !== path),
+  ].slice(0, RECENT_MAX);
+  write(RECENT_KEY, JSON.stringify(next));
+  return next;
+}
