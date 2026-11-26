@@ -568,6 +568,7 @@ mod qualification_tests {
                 height: 1080,
                 fps: 30,
                 encoder: "libx264".into(),
+                ..Default::default()
             },
             2.0,
             &cancel,

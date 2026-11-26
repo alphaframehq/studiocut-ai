@@ -24,6 +24,18 @@ fn default_aspect() -> String {
 fn default_fill() -> String {
     "fit".into()
 }
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            container: "mp4".into(),
+            height: 1080,
+            fps: 30,
+            encoder: "auto".into(),
+            aspect: default_aspect(),
+            fill: default_fill(),
+        }
+    }
+}
 impl ExportSettings {
     pub fn validate(&self) -> Result<(), String> {
         if !["mp4", "mov"].contains(&self.container.as_str())
