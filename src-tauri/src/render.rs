@@ -1,5 +1,6 @@
 use crate::{
     filtergraph::{self, ExportSettings},
+    media::{ffmpeg_path, ffprobe_path},
     Project,
 };
 use serde::Serialize;
@@ -211,7 +212,7 @@ impl ExportManager {
             if cancel.load(Ordering::SeqCst) {
                 return Err("Export cancelled".into());
             }
-            let mut command = Command::new("ffmpeg");
+            let mut command = Command::new(ffmpeg_path());
             command.current_dir(root).args([
                 "-hide_banner",
                 "-loglevel",
@@ -251,7 +252,7 @@ impl ExportManager {
             };
         });
         let temporary = root.join(format!("output.{}", settings.container));
-        let mut command = Command::new("ffmpeg");
+        let mut command = Command::new(ffmpeg_path());
         command
             .current_dir(root)
             .args([
@@ -459,7 +460,7 @@ pub fn validate_output(
     duration: f64,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let mut command = Command::new("ffprobe");
+    let mut command = Command::new(ffprobe_path());
     command
         .args([
             "-v",
@@ -528,7 +529,7 @@ mod qualification_tests {
     fn rejects_truncated_audio_despite_full_container_duration() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("truncated.mp4");
-        let mut command = Command::new("ffmpeg");
+        let mut command = Command::new(ffmpeg_path());
         command
             .args([
                 "-v",

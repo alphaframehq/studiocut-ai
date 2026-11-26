@@ -88,12 +88,43 @@ pub fn open_index(root: &Path) -> Result<Connection, String> {
     Ok(db)
 }
 
+/// Resolve the ffmpeg binary: `FFMPEG_PATH` wins when set to a non-empty
+/// value, otherwise fall back to the `ffmpeg` on PATH.
+/// (SETUP_BINARIES.md documents these variables; before this, every call
+/// site spawned bare `"ffmpeg"` and the documented variables did nothing.)
+pub(crate) fn ffmpeg_path() -> String {
+    std::env::var("FFMPEG_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_string())
+}
+
+/// Same as [`ffmpeg_path`] for ffprobe (`FFPROBE_PATH`).
+pub(crate) fn ffprobe_path() -> String {
+    std::env::var("FFPROBE_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "ffprobe".to_string())
+}
+
+/// Resolve a tool name (`"ffmpeg"` / `"ffprobe"`) to the binary that should
+/// actually be spawned, honouring the env-var overrides above.
+fn resolve_tool(tool: &str) -> String {
+    match tool {
+        "ffmpeg" => ffmpeg_path(),
+        "ffprobe" => ffprobe_path(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn run(
     tool: &str,
     args: &[&str],
     timeout: Duration,
     max_bytes: u64,
 ) -> Result<fs::File, String> {
+    let tool = resolve_tool(tool);
+    let tool = tool.as_str();
     let mut output = tempfile::tempfile().map_err(|e| e.to_string())?;
     let mut errors = tempfile::tempfile().map_err(|e| e.to_string())?;
     let mut command = Command::new(tool);
@@ -109,7 +140,7 @@ pub(crate) fn run(
     }
     let mut child = command
         .spawn()
-        .map_err(|e| format!("Cannot run {tool}. Install FFmpeg and FFprobe on PATH: {e}"))?;
+        .map_err(|e| format!("Cannot run {tool}. Install FFmpeg and FFprobe on PATH, or set FFMPEG_PATH / FFPROBE_PATH: {e}"))?;
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
