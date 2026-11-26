@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { X } from 'lucide-react';
+import { getEncoderPreference, getWhisperBinary, getWhisperModel, setEncoderPreference, setWhisperBinary, setWhisperModel } from './preferences';
 
 type Provider = 'gemini' | 'openai' | 'claude' | 'groq' | 'openrouter' | 'compatible' | 'ollama' | 'bedrock' | 'vertex';
 type LicenseStatus = { fingerprint: string; mode: string; licensed: boolean; license: { name: string; email: string; expiresAt: number | null } | null };
@@ -31,9 +32,9 @@ export function SettingsModal() {
   const [keyBusy, setKeyBusy] = useState(false);
   const [keyMessage, setKeyMessage] = useState('');
   const [keyError, setKeyError] = useState('');
-  const [encoder, setEncoder] = useState(() => localStorage.getItem('studiocut.encoderPreference') ?? 'auto');
-  const [whisperBinary, setWhisperBinary] = useState('whisper-cli');
-  const [whisperModel, setWhisperModel] = useState('');
+  const [encoder, setEncoder] = useState<string>(getEncoderPreference);
+  const [whisperBinary, setWhisperBinaryState] = useState(getWhisperBinary);
+  const [whisperModel, setWhisperModelState] = useState(getWhisperModel);
   const [whisperStatus, setWhisperStatus] = useState('');
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [licenseText, setLicenseText] = useState('');
@@ -113,7 +114,7 @@ export function SettingsModal() {
         </section>}
         {tab === 'ai' && <section aria-label="AI and encoding preferences">
           <p className="settings-note">The preferred encoder is used as the default in the export dialog. Hardware candidates are still probe-checked and fall back to libx264 with a clear disclosure.</p>
-          <label>Preferred encoder<select value={encoder} onChange={e => { setEncoder(e.target.value); localStorage.setItem('studiocut.encoderPreference', e.target.value); }}>
+          <label>Preferred encoder<select value={encoder} onChange={e => { setEncoder(e.target.value); setEncoderPreference(e.target.value); }}>
             <option value="auto">Auto · probe hardware, then CPU</option>
             <option value="libx264">libx264 · CPU</option>
             <option value="h264_nvenc">NVIDIA · H.264</option>
@@ -125,8 +126,8 @@ export function SettingsModal() {
         </section>}
         {tab === 'transcribe' && <section aria-label="Transcription setup">
           <p className="settings-note">Local transcription uses whisper.cpp (<code>whisper-cli</code>) with a GGML model file. See <strong>SETUP_BINARIES.md</strong> in the repository for placement per platform. Cloud transcription uses the key saved for its provider.</p>
-          <label>whisper-cli path or command<input value={whisperBinary} onChange={e => setWhisperBinary(e.target.value)} spellCheck={false} /></label>
-          <label>GGML model path (.bin)<input value={whisperModel} onChange={e => setWhisperModel(e.target.value)} placeholder="e.g. C:\models\ggml-base.en.bin or ~/models/ggml-base.en.bin" spellCheck={false} /></label>
+          <label>whisper-cli path or command<input value={whisperBinary} onChange={e => { setWhisperBinaryState(e.target.value); setWhisperBinary(e.target.value); }} spellCheck={false} /></label>
+          <label>GGML model path (.bin)<input value={whisperModel} onChange={e => { setWhisperModelState(e.target.value); setWhisperModel(e.target.value); }} placeholder="e.g. C:\models\ggml-base.en.bin or ~/models/ggml-base.en.bin" spellCheck={false} /></label>
           <button className="button secondary" onClick={() => void checkWhisper()}>Check availability</button>
           <div role="status" aria-live="polite">{whisperStatus && <pre className="whisper-status">{whisperStatus}</pre>}</div>
         </section>}

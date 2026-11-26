@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { native, useProject } from './store';
+import { getWhisperBinary, getWhisperModel, setWhisperBinary, setWhisperModel } from './preferences';
 import type { CaptionPreset } from './timeline';
 import type { Cut, Transcript } from './analysis';
 
@@ -11,8 +12,8 @@ export function AnalysisPanel() {
   const [minimum, setMinimum] = useState(400);
   const [padding, setPadding] = useState(80);
   const [provider, setProvider] = useState('local');
-  const [binary, setBinary] = useState('whisper-cli');
-  const [localModel, setLocalModel] = useState('');
+  const [binary, setBinaryState] = useState(getWhisperBinary);
+  const [localModel, setLocalModelState] = useState(getWhisperModel);
   const [model, setModel] = useState('whisper-1');
   const [endpoint, setEndpoint] = useState('');
   const [key, setKey] = useState('');
@@ -60,7 +61,7 @@ export function AnalysisPanel() {
       </fieldset>
       <fieldset disabled={busy}><legend>02 · Transcribe locally or BYOK</legend>
         <label>Transcription provider<select value={provider} onChange={e => { setProvider(e.target.value); setKey(''); setConsent(false); setStatus(''); setModel(e.target.value === 'groq' ? 'whisper-large-v3' : e.target.value === 'openrouter' ? 'openai/whisper-1' : 'whisper-1'); }}><option value="local">Local · whisper.cpp</option><option value="groq">Groq</option><option value="openai">OpenAI</option><option value="openrouter">OpenRouter</option><option value="openaicompatible">OpenAI-compatible</option></select></label>
-        {provider === 'local' ? <><label>whisper-cli executable<input value={binary} onChange={e => setBinary(e.target.value)} spellCheck={false} /></label><label>Local model path<input value={localModel} onChange={e => setLocalModel(e.target.value)} placeholder="/path/to/ggml-base.en.bin" spellCheck={false} /></label><button disabled={!native} onClick={() => void run('status')}>Check local availability</button>{!localModel && <p>Local transcription unavailable until you select an installed model. No automatic downloads.</p>}</> : <><p>The selected audio is sent as a 16 kHz mono WAV. Keys are session-only and never saved in project files.</p><label>API key<input type="password" autoComplete="off" value={key} onChange={e => setKey(e.target.value)} /></label><label>Transcription model<input value={model} onChange={e => setModel(e.target.value)} /></label>{provider === 'openaicompatible' && <label>Full transcription endpoint<input type="url" value={endpoint} onChange={e => setEndpoint(e.target.value)} placeholder="https://host/v1/audio/transcriptions" /></label>}<label className="upload-consent"><input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} />I allow uploading this selected audio to {provider}.</label><p>Provider must return word or segment timestamps with verbose_json. Unsupported models produce an error, not estimated timings.</p></>}
+        {provider === 'local' ? <><label>whisper-cli executable<input value={binary} onChange={e => { setBinaryState(e.target.value); setWhisperBinary(e.target.value); }} spellCheck={false} /></label><label>Local model path<input value={localModel} onChange={e => { setLocalModelState(e.target.value); setWhisperModel(e.target.value); }} placeholder="/path/to/ggml-base.en.bin" spellCheck={false} /></label><button disabled={!native} onClick={() => void run('status')}>Check local availability</button>{!localModel && <p>Local transcription unavailable until you select an installed model. No automatic downloads.</p>}</> : <><p>The selected audio is sent as a 16 kHz mono WAV. Keys are session-only and never saved in project files.</p><label>API key<input type="password" autoComplete="off" value={key} onChange={e => setKey(e.target.value)} /></label><label>Transcription model<input value={model} onChange={e => setModel(e.target.value)} /></label>{provider === 'openaicompatible' && <label>Full transcription endpoint<input type="url" value={endpoint} onChange={e => setEndpoint(e.target.value)} placeholder="https://host/v1/audio/transcriptions" /></label>}<label className="upload-consent"><input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} />I allow uploading this selected audio to {provider}.</label><p>Provider must return word or segment timestamps with verbose_json. Unsupported models produce an error, not estimated timings.</p></>}
         <label>Language · optional<input value={language} onChange={e => setLanguage(e.target.value)} placeholder="Auto-detect (or en)" maxLength={8} /></label>
         <button disabled={!eligible || (provider === 'local' ? !localModel : !consent || !key || !model)} onClick={() => void run('transcribe')}>Transcribe selected clip</button><p>Maximum 10 minutes per selection. Split longer clips first.</p>
       </fieldset>

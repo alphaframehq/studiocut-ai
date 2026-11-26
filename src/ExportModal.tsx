@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { useProject } from './store';
+import { getEncoderPreference } from './preferences';
 import './finishing.css';
 type Job = { version: 1; id: string; sequence: number; timestamp: number; state: string; progress: number; encoder: string | null; disclosure: string; output: string; error: string | null };
 const active = (job: Job | null) => !!job && ['probing', 'rendering', 'validating'].includes(job.state);
@@ -9,7 +10,10 @@ export function ExportModal({ hidden = false }: { hidden?: boolean }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const progressCursor = useRef<Job | null>(null);
   const [open, setOpen] = useState(false), [pending, setPending] = useState(false), [job, setJob] = useState<Job | null>(null), [error, setError] = useState('');
-  const [container, setContainer] = useState('mp4'), [height, setHeight] = useState(1080), [fps, setFps] = useState(30), [encoder, setEncoder] = useState('auto'), [output, setOutput] = useState('');
+  const [container, setContainer] = useState('mp4'), [height, setHeight] = useState(1080), [fps, setFps] = useState(30), [encoder, setEncoder] = useState<string>(getEncoderPreference), [output, setOutput] = useState('');
+  // Re-read the Settings preference every time the dialog opens, so a
+  // change made in Settings while this dialog was closed still applies.
+  useEffect(() => { if (open) setEncoder(getEncoderPreference()); }, [open]);
   useEffect(() => {
     if (!open || !isTauri()) return;
     let stopped = false, timer: ReturnType<typeof setTimeout>, failures = 0;
