@@ -87,6 +87,369 @@ impl Config {
         Ok(self.url()?.to_string())
     }
 }
+/// System prompt for `titles` mode: titles and hooks, not an EDL. Plain
+/// text out, so no JSON schema is attached to the request.
+pub const TITLES_SYSTEM: &str = "You are a short-form video title and hook writer. Return plain text only, no JSON, no markdown fences: first 5 numbered video titles (each under 60 characters), then a blank line, then 3 numbered opening hooks (each one spoken sentence, under 15 words). Base titles and hooks only on the supplied project context — asset names and transcript. Do not invent people, claims or footage that is not in the context. No preamble, no explanation.";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectorListedModel {
+    pub id: String,
+    pub recommended: bool,
+    /// Why this entry is here when it did not come from a live list
+    /// (static Claude/Bedrock lists). `None` for fetched models.
+    pub note: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectorModelsResponse {
+    pub models: Vec<DirectorListedModel>,
+    /// Explains an empty list (Vertex) or a static list; `None` otherwise.
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectorModelsRequest {
+    pub provider: String,
+    pub api_key: String,
+    pub endpoint: String,
+}
+
+const MAX_DIRECTOR_MODELS_JSON: u64 = 2_000_000;
+
+/// Well-known current chat models. Only flagged when actually present in
+/// the fetched list — never injected into it.
+const RECOMMENDED_DIRECTOR_MODELS: [&str; 7] = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "claude-sonnet-4-5",
+    "gemini-2.5-flash",
+    "llama-3.3-70b-versatile",
+    "openai/gpt-4o",
+    "qwen/qwen-2.5-72b-instruct",
+];
+
+/// Substrings that mark a model as not-a-chat-model for the Director.
+const NON_CHAT_MARKERS: [&str; 10] = [
+    "embedding",
+    "whisper",
+    "tts",
+    "dall-e",
+    "moderation",
+    "audio",
+    "image",
+    "video",
+    "rerank",
+    "guard",
+];
+
+/// Ids that look like chat models on providers that do not report a
+/// modality (OpenRouter without `architecture.modality`).
+const CHAT_FAMILIES: [&str; 12] = [
+    "gpt-", "claude", "llama", "qwen", "mistral", "gemini", "deepseek", "grok", "phi-", "mixtral",
+    "command", "glm-",
+];
+
+const CLAUDE_STATIC_NOTE: &str = "Anthropic publishes no list API — known models shown";
+const BEDROCK_STATIC_NOTE: &str = "Bedrock needs AWS signing for a live list — known models shown";
+const VERTEX_NOTE: &str =
+    "Vertex model list needs a project-scoped API call — paste the full model path";
+
+#[derive(Clone, Copy, PartialEq)]
+enum ModelsAuth {
+    Bearer,
+    GoogApiKey,
+    None,
+}
+
+/// Derive the `/models` (or Ollama `/api/tags`) URL for a provider, plus
+/// how to authenticate. Static-list providers (claude/bedrock) and Vertex
+/// never reach this function — see [`list_director_models`].
+pub fn director_models_endpoint(
+    provider: &str,
+    endpoint: &str,
+) -> Result<(reqwest::Url, ModelsAuth), String> {
+    let (raw, auth) = match provider {
+        "openai" => (
+            "https://api.openai.com/v1/models".to_string(),
+            ModelsAuth::Bearer,
+        ),
+        "groq" => (
+            "https://api.groq.com/openai/v1/models".to_string(),
+            ModelsAuth::Bearer,
+        ),
+        "openrouter" => (
+            "https://openrouter.ai/api/v1/models".to_string(),
+            ModelsAuth::Bearer,
+        ),
+        "gemini" => (
+            "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
+            ModelsAuth::GoogApiKey,
+        ),
+        "compatible" => {
+            let trimmed = endpoint.trim_end_matches('/');
+            let base = if let Some(stripped) = trimmed.strip_suffix("/chat/completions") {
+                stripped.to_string()
+            } else if trimmed.ends_with("/models") {
+                trimmed.to_string()
+            } else {
+                return Err("Enter the full chat endpoint URL ending in /chat/completions".into());
+            };
+            (format!("{base}/models"), ModelsAuth::Bearer)
+        }
+        "ollama" => {
+            let trimmed = endpoint.trim_end_matches('/');
+            let base = if trimmed.is_empty() {
+                "http://127.0.0.1:11434".to_string()
+            } else {
+                trimmed
+                    .strip_suffix("/api/chat")
+                    .unwrap_or(trimmed)
+                    .to_string()
+            };
+            (format!("{base}/api/tags"), ModelsAuth::None)
+        }
+        _ => return Err("Unknown Director provider".into()),
+    };
+    let url = reqwest::Url::parse(&raw).map_err(|_| "Enter a complete models endpoint URL")?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Models endpoint must not contain credentials, query, or fragment".into());
+    }
+    match provider {
+        "ollama" => {
+            let host = url.host_str().unwrap_or("");
+            if url.scheme() != "http" || !["localhost", "127.0.0.1", "[::1]"].contains(&host) {
+                return Err("Ollama models must come from a loopback http:// endpoint".into());
+            }
+        }
+        _ => {
+            if url.scheme() != "https" {
+                return Err("Cloud model lists require HTTPS".into());
+            }
+        }
+    }
+    Ok((url, auth))
+}
+
+/// Keep only chat/text models from an OpenAI-style `{data:[{id, ...}]}`
+/// list. Drops embedding/audio/image/video/TTS and similar models.
+/// OpenRouter items may carry `architecture.modality` ("text->text") or
+/// `input_modalities`; without either, a known chat family id is required.
+pub fn filter_director_models(value: &Value, provider: &str) -> Vec<DirectorListedModel> {
+    let mut models: Vec<DirectorListedModel> = value["data"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item["id"].as_str()?.to_string();
+                    let lower = id.to_lowercase();
+                    if NON_CHAT_MARKERS.iter().any(|m| lower.contains(m)) {
+                        return None;
+                    }
+                    if provider == "openrouter" {
+                        let modality = item
+                            .pointer("/architecture/modality")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let input_modalities = item
+                            .pointer("/architecture/input_modalities")
+                            .and_then(Value::as_array)
+                            .map(|m| m.iter().any(|v| v.as_str() == Some("text")))
+                            .unwrap_or(false);
+                        let text_modality = modality.starts_with("text")
+                            || modality.contains("text->")
+                            || input_modalities;
+                        let chat_family = CHAT_FAMILIES.iter().any(|f| lower.contains(f));
+                        if !text_modality && !chat_family {
+                            return None;
+                        }
+                    }
+                    Some(DirectorListedModel {
+                        recommended: RECOMMENDED_DIRECTOR_MODELS.contains(&id.as_str()),
+                        id,
+                        note: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.truncate(100);
+    models
+}
+
+/// Gemini `{models:[{name:"models/...", supportedGenerationMethods}]}`:
+/// keep only entries that support generateContent, strip the `models/`
+/// prefix from the id.
+pub fn filter_gemini_models(value: &Value) -> Vec<DirectorListedModel> {
+    let mut models: Vec<DirectorListedModel> = value["models"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item["name"].as_str()?;
+                    let supports = item["supportedGenerationMethods"]
+                        .as_array()
+                        .is_some_and(|m| m.iter().any(|v| v.as_str() == Some("generateContent")));
+                    if !supports {
+                        return None;
+                    }
+                    let id = name.strip_prefix("models/").unwrap_or(name).to_string();
+                    let lower = id.to_lowercase();
+                    if NON_CHAT_MARKERS.iter().any(|m| lower.contains(m)) {
+                        return None;
+                    }
+                    Some(DirectorListedModel {
+                        recommended: RECOMMENDED_DIRECTOR_MODELS.contains(&id.as_str()),
+                        id,
+                        note: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.truncate(100);
+    models
+}
+
+/// Ollama `{models:[{name}]}`: local model names, kept as-is (minus the
+/// non-chat markers); no auth, loopback only.
+pub fn filter_ollama_models(value: &Value) -> Vec<DirectorListedModel> {
+    let mut models: Vec<DirectorListedModel> = value["models"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item["name"].as_str()?.to_string();
+                    let lower = id.to_lowercase();
+                    if NON_CHAT_MARKERS.iter().any(|m| lower.contains(m)) {
+                        return None;
+                    }
+                    Some(DirectorListedModel {
+                        recommended: false,
+                        id,
+                        note: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.truncate(100);
+    models
+}
+
+fn static_models(ids: &[&str], note: &str) -> Vec<DirectorListedModel> {
+    ids.iter()
+        .map(|id| DirectorListedModel {
+            id: id.to_string(),
+            recommended: RECOMMENDED_DIRECTOR_MODELS.contains(id),
+            note: Some(note.to_string()),
+        })
+        .collect()
+}
+
+/// Fetch (or, for providers without a list API, return a labelled static
+/// list of) Director chat models. The API key is used for this one call
+/// only and is never stored.
+pub fn list_director_models(
+    request: &DirectorModelsRequest,
+) -> Result<DirectorModelsResponse, String> {
+    match request.provider.as_str() {
+        "claude" => {
+            return Ok(DirectorModelsResponse {
+                models: static_models(
+                    &[
+                        "claude-opus-4-1",
+                        "claude-sonnet-4-5",
+                        "claude-3-5-sonnet-latest",
+                        "claude-3-5-haiku-latest",
+                        "claude-3-haiku-20240307",
+                    ],
+                    CLAUDE_STATIC_NOTE,
+                ),
+                note: Some(CLAUDE_STATIC_NOTE.into()),
+            });
+        }
+        "bedrock" => {
+            return Ok(DirectorModelsResponse {
+                models: static_models(
+                    &[
+                        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                        "amazon.titan-text-premier-v1:0",
+                        "meta.llama3-70b-instruct-v1:0",
+                        "mistral.mistral-large-2402-v1:0",
+                    ],
+                    BEDROCK_STATIC_NOTE,
+                ),
+                note: Some(BEDROCK_STATIC_NOTE.into()),
+            });
+        }
+        "vertex" => {
+            return Ok(DirectorModelsResponse {
+                models: vec![],
+                note: Some(VERTEX_NOTE.into()),
+            });
+        }
+        _ => {}
+    }
+    if request.provider != "ollama"
+        && (request.api_key.trim().is_empty() || request.api_key.len() > 4096)
+    {
+        return Err("Enter an API key first".into());
+    }
+    let (url, auth) = director_models_endpoint(&request.provider, &request.endpoint)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Cannot initialize secure Director client")?;
+    let mut request_builder = client.get(url);
+    request_builder = match auth {
+        ModelsAuth::Bearer => request_builder.bearer_auth(request.api_key.trim()),
+        ModelsAuth::GoogApiKey => request_builder.header("x-goog-api-key", request.api_key.trim()),
+        ModelsAuth::None => request_builder,
+    };
+    let response = request_builder.send().map_err(|_| {
+        "Model list request failed. Check the endpoint, network, and TLS certificate; no automatic retry was made"
+    })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Model list request returned HTTP {}. Check the API key and provider",
+            response.status().as_u16()
+        ));
+    }
+    let mut data = Vec::new();
+    response
+        .take(MAX_DIRECTOR_MODELS_JSON + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "Failed reading model list response")?;
+    if data.len() as u64 > MAX_DIRECTOR_MODELS_JSON {
+        return Err("Model list exceeds the 2 MB response limit".into());
+    }
+    let value: Value =
+        serde_json::from_slice(&data).map_err(|_| "Model list returned invalid JSON")?;
+    let models = match request.provider.as_str() {
+        "gemini" => filter_gemini_models(&value),
+        "ollama" => filter_ollama_models(&value),
+        _ => filter_director_models(&value, &request.provider),
+    };
+    Ok(DirectorModelsResponse { models, note: None })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Context {
@@ -126,6 +489,9 @@ pub fn context(project: &Project) -> Context {
 pub struct Proposal {
     pub edl: Edl,
     pub trace: Trace,
+    /// Plain-text answer for `titles` mode; `None` for edit proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +540,27 @@ pub fn request_body(config: &Config, prompt: &str) -> Value {
         }
     }
 }
+/// Titles mode: same provider body shapes as [`request_body`] but without
+/// the EDL JSON schema — the model answers in plain text.
+pub fn titles_body(config: &Config, prompt: &str) -> Value {
+    match config.provider {
+        Provider::Claude => {
+            json!({"model":config.model,"max_tokens":config.max_tokens,"system":TITLES_SYSTEM,"messages":[{"role":"user","content":prompt}]})
+        }
+        Provider::Gemini | Provider::Vertex => {
+            json!({"systemInstruction":{"parts":[{"text":TITLES_SYSTEM}]},"contents":[{"role":"user","parts":[{"text":prompt}]}],"generationConfig":{"maxOutputTokens":config.max_tokens}})
+        }
+        Provider::Bedrock => {
+            json!({"system":[{"text":TITLES_SYSTEM}],"messages":[{"role":"user","content":[{"text":prompt}]}],"inferenceConfig":{"maxTokens":config.max_tokens}})
+        }
+        Provider::Ollama => {
+            json!({"model":config.model,"stream":false,"messages":[{"role":"system","content":TITLES_SYSTEM},{"role":"user","content":prompt}],"options":{"num_predict":config.max_tokens,"num_ctx":32768}})
+        }
+        _ => {
+            json!({"model":config.model,"max_tokens":config.max_tokens,"messages":[{"role":"system","content":TITLES_SYSTEM},{"role":"user","content":prompt}]})
+        }
+    }
+}
 pub fn extract(provider: Provider, value: &Value) -> Result<String, String> {
     let text = match provider {
         Provider::Claude => value.pointer("/content/0/text"),
@@ -194,6 +581,7 @@ impl Director {
         config: Config,
         instruction: String,
         consent: bool,
+        mode: &str,
     ) -> Result<Proposal, String> {
         if self.0.swap(true, Ordering::AcqRel) {
             return Err("A Director request is already running".into());
@@ -216,7 +604,12 @@ impl Director {
         }
         let prompt =
             json!({"instruction":instruction,"untrustedProjectContext":context.data}).to_string();
-        let body = request_body(&config, &prompt);
+        let titles = mode == "titles";
+        let body = if titles {
+            titles_body(&config, &prompt)
+        } else {
+            request_body(&config, &prompt)
+        };
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(10))
@@ -258,8 +651,186 @@ impl Director {
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid provider JSON")?;
         let text = extract(config.provider, &value)?;
+        if titles {
+            // Titles & hooks: plain text back, no EDL to apply.
+            let edl = Edl {
+                version: 1,
+                project_id: project.id,
+                base_revision: project.revision,
+                summary: "Titles & hooks".into(),
+                operations: vec![],
+            };
+            return Ok(Proposal { edl, text: Some(text), trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:2, estimated_cost:None, request_body:body, tool_calls:vec![] } });
+        }
         let edl = edl::parse(&text)?;
         edl::compile(project, &edl)?;
-        Ok(Proposal { edl, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:1, estimated_cost:None, request_body:body, tool_calls:vec![] } })
+        Ok(Proposal { edl, text: None, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:1, estimated_cost:None, request_body:body, tool_calls:vec![] } })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn models_endpoint_derivation_and_https_rules() {
+        let (url, auth) = director_models_endpoint("openai", "").unwrap();
+        assert_eq!(url.as_str(), "https://api.openai.com/v1/models");
+        assert_eq!(auth, ModelsAuth::Bearer);
+        let (url, _) = director_models_endpoint("groq", "").unwrap();
+        assert_eq!(url.as_str(), "https://api.groq.com/openai/v1/models");
+        let (url, _) = director_models_endpoint("openrouter", "").unwrap();
+        assert_eq!(url.as_str(), "https://openrouter.ai/api/v1/models");
+        let (url, auth) = director_models_endpoint("gemini", "").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+        assert_eq!(auth, ModelsAuth::GoogApiKey);
+        let (url, auth) =
+            director_models_endpoint("compatible", "https://host.example/v1/chat/completions")
+                .unwrap();
+        assert_eq!(url.as_str(), "https://host.example/v1/models");
+        assert_eq!(auth, ModelsAuth::Bearer);
+        assert!(director_models_endpoint("compatible", "https://host.example/v1/other").is_err());
+        assert!(
+            director_models_endpoint("compatible", "http://host.example/v1/chat/completions")
+                .is_err()
+        );
+        let (url, auth) = director_models_endpoint("ollama", "").unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:11434/api/tags");
+        assert_eq!(auth, ModelsAuth::None);
+        let (url, _) =
+            director_models_endpoint("ollama", "http://127.0.0.1:11434/api/chat").unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:11434/api/tags");
+        assert!(director_models_endpoint("ollama", "http://192.168.1.2:11434/api/chat").is_err());
+        assert!(director_models_endpoint("unknown", "").is_err());
+    }
+    #[test]
+    fn filter_director_models_drops_non_chat_and_marks_recommended() {
+        let value = json!({"data":[
+            {"id":"gpt-4o"},
+            {"id":"gpt-4o-mini"},
+            {"id":"text-embedding-3-small"},
+            {"id":"whisper-1"},
+            {"id":"dall-e-3"},
+            {"id":"gpt-4o-audio-preview"},
+            {"id":"o1-preview"},
+        ]});
+        let kept: Vec<&str> = filter_director_models(&value, "openai")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["gpt-4o", "gpt-4o-mini", "o1-preview"]);
+        let models = filter_director_models(&value, "openai");
+        assert!(
+            models
+                .iter()
+                .find(|m| m.id == "gpt-4o")
+                .unwrap()
+                .recommended
+        );
+        assert!(
+            !models
+                .iter()
+                .find(|m| m.id == "o1-preview")
+                .unwrap()
+                .recommended
+        );
+    }
+    #[test]
+    fn filter_director_models_openrouter_modality_and_families() {
+        let value = json!({"data":[
+            {"id":"openai/gpt-4o","architecture":{"modality":"text->text"}},
+            {"id":"meta-llama/llama-3.3-70b-instruct","architecture":{"modality":"text->text"}},
+            {"id":"openai/text-embedding-3-small","architecture":{"modality":"text->text"}},
+            {"id":"some-vendor/whisper-large","architecture":{"modality":"audio->text"}},
+            {"id":"qwen/qwen-2.5-72b-instruct"},
+            {"id":"mystery/image-gen-1","architecture":{"modality":"text->image"}},
+        ]});
+        let kept: Vec<&str> = filter_director_models(&value, "openrouter")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(kept.contains(&"openai/gpt-4o"));
+        assert!(kept.contains(&"meta-llama/llama-3.3-70b-instruct"));
+        assert!(kept.contains(&"qwen/qwen-2.5-72b-instruct"));
+        assert!(!kept
+            .iter()
+            .any(|id| id.contains("embedding") || id.contains("whisper")));
+    }
+    #[test]
+    fn filter_gemini_models_keeps_generate_content_only() {
+        let value = json!({"models":[
+            {"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]},
+            {"name":"models/embedding-001","supportedGenerationMethods":["embedContent"]},
+            {"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent","countTokens"]},
+        ]});
+        let kept: Vec<&str> = filter_gemini_models(&value)
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["gemini-2.5-flash", "gemini-2.5-pro"]);
+    }
+    #[test]
+    fn filter_ollama_models_keeps_names() {
+        let value = json!({"models":[
+            {"name":"llama3.3:70b"},
+            {"name":"qwen2.5:72b"},
+        ]});
+        let kept: Vec<&str> = filter_ollama_models(&value)
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["llama3.3:70b", "qwen2.5:72b"]);
+    }
+    #[test]
+    fn static_lists_are_labelled_and_vertex_is_empty() {
+        let claude = list_director_models(&DirectorModelsRequest {
+            provider: "claude".into(),
+            api_key: "".into(),
+            endpoint: "".into(),
+        })
+        .unwrap();
+        assert_eq!(claude.models.len(), 5);
+        assert!(claude.models.iter().all(|m| m.note.is_some()));
+        assert!(claude
+            .models
+            .iter()
+            .any(|m| m.id == "claude-sonnet-4-5" && m.recommended));
+        let bedrock = list_director_models(&DirectorModelsRequest {
+            provider: "bedrock".into(),
+            api_key: "".into(),
+            endpoint: "".into(),
+        })
+        .unwrap();
+        assert_eq!(bedrock.models.len(), 5);
+        let vertex = list_director_models(&DirectorModelsRequest {
+            provider: "vertex".into(),
+            api_key: "".into(),
+            endpoint: "".into(),
+        })
+        .unwrap();
+        assert!(vertex.models.is_empty());
+        assert!(vertex.note.unwrap().contains("Vertex"));
+        let missing_key = list_director_models(&DirectorModelsRequest {
+            provider: "openai".into(),
+            api_key: "".into(),
+            endpoint: "".into(),
+        });
+        assert!(missing_key.is_err());
+    }
+    #[test]
+    fn titles_body_has_no_edl_schema() {
+        let config = Config {
+            provider: Provider::Openai,
+            model: "gpt-4o".into(),
+            endpoint: "".into(),
+            max_tokens: 512,
+        };
+        let body = titles_body(&config, "prompt");
+        assert!(!body.to_string().contains("baseRevision"));
+        assert!(body.to_string().contains("title and hook writer"));
+        let edit = request_body(&config, "prompt");
+        assert!(edit.to_string().contains("baseRevision"));
     }
 }
