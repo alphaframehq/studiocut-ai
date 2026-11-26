@@ -59,3 +59,15 @@ fn rejects_invalid_boundaries_and_preserves_existing_files() {
     assert!(load_project(&path).is_err());
     assert!(load_project(&directory.path().join("missing.studiocut")).is_err());
 }
+
+#[test]
+fn autosave_backup_round_trips_as_a_valid_project() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("edit.studiocut");
+    let project = create_project("Backup".into(), 1920, 1080, 30).unwrap();
+    save_project(&project, &path).unwrap();
+    let backup = studiocut_ai::autosave_path(&path);
+    save_project(&project, &backup).unwrap();
+    assert_eq!(load_project(&backup).unwrap(), project);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+}

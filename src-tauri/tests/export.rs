@@ -472,3 +472,72 @@ fn realtime_channel_two_clients_delivery_replay_and_vanished_reader() {
     assert!(root.path().join("channel.mp4").is_file());
     println!("Real FFmpeg progress: two clients max latency {latency1}/{latency2} ms; {} missed events replayed after reader disconnected; export completed", replay.events.len());
 }
+
+fn vertical_settings(fill: &str) -> ExportSettings {
+    ExportSettings {
+        container: "mp4".into(),
+        height: 1080,
+        fps: 30,
+        encoder: "libx264".into(),
+        aspect: "vertical".into(),
+        fill: fill.into(),
+    }
+}
+
+fn probe_dimensions(path: &Path) -> (u32, u32) {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let (w, h) = text.trim().split_once(',').unwrap();
+    (w.parse().unwrap(), h.parse().unwrap())
+}
+
+#[test]
+fn vertical_and_square_exports_render_native_canvases() {
+    let root = tempfile::tempdir().unwrap();
+    let p = fixture(root.path());
+    let cover = compile(&p, &vertical_settings("cover")).unwrap();
+    assert!(
+        cover.graph.contains("color=c=black:s=608x1080"),
+        "vertical base canvas must be 608x1080"
+    );
+    assert!(
+        cover.graph.contains("crop=608:1080"),
+        "cover must center-crop"
+    );
+    let fit = compile(&p, &vertical_settings("fit")).unwrap();
+    assert!(fit.graph.contains("color=c=black:s=608x1080"));
+    assert!(fit.graph.contains("pad=608:1080"), "fit must pillarbox");
+    assert!(compile(
+        &p,
+        &ExportSettings {
+            aspect: "square".into(),
+            fill: "fit".into(),
+            ..vertical_settings("fit")
+        }
+    )
+    .unwrap()
+    .graph
+    .contains("color=c=black:s=1080x1080"));
+    let manager = ExportManager::default();
+    let output = root.path().join("vertical.mp4");
+    let job = manager
+        .start(p.clone(), output.clone(), vertical_settings("cover"))
+        .unwrap();
+    let final_state = wait(&manager, job.id);
+    assert_eq!(final_state.state, "completed", "{final_state:?}");
+    assert_eq!(probe_dimensions(&output), (608, 1080));
+}
