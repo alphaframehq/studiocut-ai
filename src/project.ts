@@ -7,6 +7,7 @@ export type Asset = {
   fps: number | null; videoStream: number | null; audioStream: number | null;
   videoCodec: string | null; audioCodec: string | null; sampleRate: number | null; channels: number | null; createdAt: number;
 };
+export type Marker = { id: string; frame: number; label: string };
 export type Project = {
   schemaVersion: 1 | 2 | 3 | 4 | 5 | 6;
   id: string;
@@ -16,6 +17,7 @@ export type Project = {
   settings: { width: number; height: number; fps: number; audioSampleRate: 48000 };
   assets: Asset[];
   tracks: Track[];
+  markers: Marker[];
 };
 
 const uuid = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -32,6 +34,14 @@ export function validateProject(value: unknown): Project {
   if (!uint(p.revision) || !uint(p.createdAt) || (p.schemaVersion === 1 && p.revision !== 0)) throw new Error('Invalid project revision or creation date.');
   if (!s || !Number.isInteger(s.width) || !Number.isInteger(s.height) || s.width < 16 || s.width > 8192 || s.height < 16 || s.height > 8192 || ![24, 25, 30, 50, 60].includes(s.fps) || s.audioSampleRate !== 48000) throw new Error('Unsupported project settings.');
   if (!Array.isArray(p.assets) || !Array.isArray(p.tracks) || (p.schemaVersion < 3 && p.tracks.length) || (p.schemaVersion === 1 && p.assets.length)) throw new Error('Unsupported project graph. Your file has not been changed.');
+  // Markers are optional: v1–v6 files load with an empty list.
+  if (p.markers === undefined) p.markers = [];
+  if (!Array.isArray(p.markers) || p.markers.length > 200) throw new Error('Invalid timeline markers.');
+  const markerIds = new Set<string>();
+  for (const m of p.markers) {
+    if (!m || !uuid(m.id) || markerIds.has(m.id) || !uint(m.frame) || m.frame > 21600 * 60 || typeof m.label !== 'string' || !m.label.trim() || m.label.length > 80 || !keys(m, ['id', 'frame', 'label'])) throw new Error('Invalid timeline marker.');
+    markerIds.add(m.id);
+  }
   const ids = new Set<string>();
   for (const a of p.assets) {
     if (!a || typeof a !== 'object' || !uuid(a.id) || ids.has(a.id) || typeof a.sourcePath !== 'string' || !a.sourcePath || a.sourcePath.includes('\0') || typeof a.name !== 'string' || !a.name || !uint(a.sizeBytes) || a.sizeBytes === 0 || !uint(a.createdAt) || typeof a.modifiedNs !== 'string' || !/^\d+$/.test(a.modifiedNs) || BigInt(a.modifiedNs) > (1n << 128n) - 1n || !['video', 'audio', 'image'].includes(a.kind)
@@ -83,7 +93,7 @@ export function validateProject(value: unknown): Project {
     const [a, b] = pair;
     if (pair.length !== 2 || a.kind === b.kind || (a.clip.effects?.finishing?.speed ?? 1) !== (b.clip.effects?.finishing?.speed ?? 1) || ['assetId', 'start', 'sourceIn', 'duration'].some(k => a.clip[k as keyof Clip] !== b.clip[k as keyof Clip])) throw new Error('Linked clips must be a synchronized video/audio pair.');
   }
-  if (!keys(p, ['schemaVersion', 'id', 'name', 'revision', 'createdAt', 'settings', 'assets', 'tracks']) || !keys(s, ['width', 'height', 'fps', 'audioSampleRate'])) throw new Error('This project contains unsupported fields.');
+  if (!keys(p, ['schemaVersion', 'id', 'name', 'revision', 'createdAt', 'settings', 'assets', 'tracks', 'markers']) || !keys(s, ['width', 'height', 'fps', 'audioSampleRate'])) throw new Error('This project contains unsupported fields.');
   if (new TextEncoder().encode(JSON.stringify(p, null, 2)).length > 1048576) throw new Error('Project file exceeds 1 MB.');
   return p;
 }
