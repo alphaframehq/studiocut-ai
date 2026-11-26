@@ -54,6 +54,79 @@ fn fixture(root: &std::path::Path) -> Project {
 }
 
 #[test]
+fn real_scene_detection_finds_hard_cut_and_scores_shots() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("red-blue.mp4");
+    // 2 s solid red, hard cut to 2 s solid blue.
+    assert!(Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=160x90:r=30:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x90:r=30:d=2",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&input)
+        .status()
+        .unwrap()
+        .success());
+    let asset = media::import_media(&root.join("cache"), &input).unwrap();
+    assert!(asset.video_stream.is_some());
+    let mut project = create_project("Scene roundtrip".into(), 1920, 1080, 30).unwrap();
+    project.schema_version = 3;
+    let duration = (asset.duration.unwrap() * 30.0).floor() as u32;
+    let clip = Clip {
+        id: Uuid::new_v4(),
+        asset_id: asset.id,
+        link_id: None,
+        start: 0,
+        source_in: 0,
+        duration,
+        caption: None,
+        effects: None,
+    };
+    project.assets.push(asset);
+    project.tracks.push(Track {
+        id: Uuid::new_v4(),
+        name: "Video".into(),
+        kind: "video".into(),
+        muted: false,
+        solo: false,
+        locked: false,
+        clips: vec![clip],
+    });
+    project.validate().unwrap();
+    let id = project.tracks[0].clips[0].id;
+    let scenes = analysis::detect_scenes(&project, id, 0.4).unwrap();
+    assert!(!scenes.is_empty(), "at least one scene");
+    assert_eq!(scenes[0].start, 0.0);
+    assert!((scenes.last().unwrap().end - duration as f64 / 30.0).abs() < 0.05);
+    // The hard red→blue cut at 2 s must appear as a boundary near 2 s.
+    let boundary_near_cut = scenes.iter().skip(1).any(|s| (s.start - 2.0).abs() < 0.3);
+    assert!(
+        boundary_near_cut,
+        "expected a scene boundary near 2 s, got {scenes:?}"
+    );
+    // Every scene gets a heuristic score (solid colours have luma spread,
+    // so the score is present even if it is not high).
+    assert!(scenes.iter().all(|s| s.score.is_some()));
+    assert!(analysis::detect_scenes(&project, id, 0.05).is_err());
+    assert!(analysis::detect_scenes(&project, id, 0.95).is_err());
+}
+
+#[test]
 fn real_dsp_wav_captions_ripple_and_atomic_undo() {
     let root = tempfile::tempdir().unwrap();
     let mut project = fixture(root.path());
