@@ -260,6 +260,103 @@ pub fn validate(transcript: &Transcript, duration: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Filler-word ranges (clip-relative seconds) for a word-timestamped
+/// transcript. `language`: `"hi"` / `"hinglish"` uses the Hindi/Hinglish
+/// set, `"en"` the English set, anything else (empty/auto) uses both.
+/// Each hit is padded by 0.08 s on both sides and overlapping/adjacent
+/// hits (< 0.05 s gap) are merged. Case-insensitive, surrounding
+/// punctuation stripped; "you know" merges as one bigram hit.
+pub fn filler_ranges(words: &[TimedText], language: &str) -> Vec<(f64, f64)> {
+    let lang = language.trim().to_lowercase();
+    let hindi = lang == "hi" || lang == "hinglish" || lang.starts_with("hi-");
+    let english = lang == "en" || lang.starts_with("en-");
+    let use_en = english || (!hindi && !english);
+    let use_hi = hindi || (!hindi && !english);
+    let is_filler = |word: &str| -> bool {
+        if use_en && matches!(word, "um" | "uh" | "hmm" | "like") {
+            return true;
+        }
+        if use_hi && matches!(word, "matlab" | "hmm" | "aah" | "arre" | "woh") {
+            return true;
+        }
+        false
+    };
+    let clean = |text: &str| -> String {
+        text.trim()
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    let mut ranges: Vec<(f64, f64)> = vec![];
+    let mut i = 0;
+    while i < words.len() {
+        let word = clean(&words[i].text);
+        // Bigram "you know" (English set only) counts as one hit.
+        if use_en && word == "you" && i + 1 < words.len() && clean(&words[i + 1].text) == "know" {
+            ranges.push(((words[i].start - 0.08).max(0.0), words[i + 1].end + 0.08));
+            i += 2;
+            continue;
+        }
+        if is_filler(&word) && words[i].end > words[i].start {
+            ranges.push(((words[i].start - 0.08).max(0.0), words[i].end + 0.08));
+        }
+        i += 1;
+    }
+    ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = vec![];
+    for range in ranges {
+        if let Some(last) = merged.last_mut() {
+            if range.0 - last.1 < 0.05 {
+                last.1 = last.1.max(range.1);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    // Round to milliseconds so callers can compare ranges exactly.
+    merged
+        .into_iter()
+        .map(|(a, b)| ((a * 1000.0).round() / 1000.0, (b * 1000.0).round() / 1000.0))
+        .collect()
+}
+
+/// Convert [`filler_ranges`] hits into timeline-frame [`Cut`]s for a
+/// clip. Validates the words the same way [`validate`] does: sorted,
+/// at most 12000, inside the clip.
+pub fn filler_cuts(
+    project: &Project,
+    clip_id: Uuid,
+    words: &[TimedText],
+    language: &str,
+) -> Result<Vec<crate::analysis::Cut>, String> {
+    let (_, clip) = selected_audio(project, clip_id)?;
+    if words.len() > 12000 {
+        return Err("Transcript has too many words".into());
+    }
+    let fps = project.settings.fps as f64;
+    let duration = clip.duration as f64 / fps;
+    let mut end = 0.0;
+    for word in words {
+        if word.text.trim().is_empty()
+            || !word.start.is_finite()
+            || !word.end.is_finite()
+            || word.start < end
+            || word.end <= word.start
+            || word.end > duration + 0.05
+        {
+            return Err("Transcript has invalid, overlapping, or out-of-range timestamps".into());
+        }
+        end = word.end;
+    }
+    Ok(filler_ranges(words, language)
+        .into_iter()
+        .filter_map(|(a, b)| {
+            let start = clip.start + (a * fps).ceil() as u32;
+            let end = (clip.start + (b * fps).floor() as u32).min(clip.start + clip.duration);
+            (end > start).then_some(crate::analysis::Cut { start, end })
+        })
+        .collect())
+}
+
 pub fn cloud_endpoint(options: &TranscriptionOptions) -> Result<reqwest::Url, String> {
     let raw = match options.provider.as_str() {
         "groq" => "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -838,6 +935,55 @@ mod tests {
         assert_eq!(capped.len(), 100);
         assert_eq!(capped[0].id, "whisper-model-000");
         assert_eq!(capped[99].id, "whisper-model-099");
+    }
+    #[test]
+    fn filler_ranges_english_hindi_bigram_and_merge() {
+        let word = |text: &str, start: f64, end: f64| TimedText {
+            text: text.into(),
+            start,
+            end,
+        };
+        // English: um/uh/like + "you know" bigram, punctuation + case ignored.
+        // The um and you-know hits overlap after padding, so they merge.
+        let ranges = filler_ranges(
+            &[
+                word("Hello", 0.0, 0.5),
+                word("Um,", 0.6, 0.9),
+                word("you", 1.0, 1.2),
+                word("know", 1.2, 1.5),
+                word("LIKE", 2.0, 2.3),
+            ],
+            "en",
+        );
+        assert_eq!(ranges, vec![(0.52, 1.58), (1.92, 2.38)]);
+        // Adjacent hits (< 0.05 s gap) merge: um at 0.6–0.9 and uh at
+        // 1.03–1.2 give padded ranges 0.52–0.98 and 0.95–1.28 (gap -0.03).
+        let merged = filler_ranges(&[word("um", 0.6, 0.9), word("uh", 1.03, 1.2)], "en");
+        assert_eq!(merged, vec![(0.52, 1.28)]);
+        // A 0.05 s gap does NOT merge.
+        let separate = filler_ranges(&[word("um", 0.6, 0.9), word("uh", 1.11, 1.2)], "en");
+        assert_eq!(separate, vec![(0.52, 0.98), (1.03, 1.28)]);
+        // Hindi/Hinglish set; English-only "like" is not a filler here.
+        let hindi = filler_ranges(
+            &[
+                word("matlab", 0.0, 0.4),
+                word("like", 1.0, 1.3),
+                word("arre", 2.0, 2.4),
+            ],
+            "hi",
+        );
+        assert_eq!(hindi, vec![(0.0, 0.48), (1.92, 2.48)]);
+        // Empty language uses both sets.
+        assert_eq!(
+            filler_ranges(&[word("um", 0.0, 0.3), word("woh", 1.0, 1.3)], ""),
+            vec![(0.0, 0.38), (0.92, 1.38)]
+        );
+        // Start clamps at 0.
+        assert_eq!(
+            filler_ranges(&[word("um", 0.02, 0.3)], "en"),
+            vec![(0.0, 0.38)]
+        );
+        assert!(filler_ranges(&[], "en").is_empty());
     }
     #[test]
     fn local_model_scan_lists_bin_files_only() {

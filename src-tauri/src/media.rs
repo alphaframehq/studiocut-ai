@@ -34,6 +34,11 @@ pub struct Asset {
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
     pub created_at: u64,
+    /// Organisational bin label, set from the media library. Lives only
+    /// in the project file (the media index DB has no bin column), so a
+    /// reimport/relink resets it to "" (Unsorted).
+    #[serde(default)]
+    pub bin: String,
 }
 
 impl Asset {
@@ -55,6 +60,8 @@ impl Asset {
             || self
                 .duration
                 .is_some_and(|n| !n.is_finite() || n <= 0.0 || n > 21600.0)
+            || self.bin.contains('\0')
+            || self.bin.encode_utf16().count() > 80
             || self.fps.is_some_and(|n| !n.is_finite() || n < 0.0)
             || [self.width, self.height, self.sample_rate, self.channels]
                 .iter()
@@ -178,6 +185,77 @@ pub(crate) fn run(
     }
     output.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     Ok(output)
+}
+
+/// Like [`run`], but returns stdout and stderr as text instead of a temp
+/// file. Same bounded spawn: timeout, stdout capped at `max_bytes`, stderr
+/// capped at 4 MB. Used by analysis passes (scene/showinfo, signalstats)
+/// whose output is log text, not media bytes.
+pub(crate) fn run_text(
+    tool: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<(String, String), String> {
+    let tool = resolve_tool(tool);
+    let tool = tool.as_str();
+    let mut output = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let mut errors = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let mut command = Command::new(tool);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(output.try_clone().map_err(|e| e.to_string())?)
+        .stderr(errors.try_clone().map_err(|e| e.to_string())?);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Cannot run {tool}. Install FFmpeg and FFprobe on PATH, or set FFMPEG_PATH / FFPROBE_PATH: {e}"))?;
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        }
+        if start.elapsed() > timeout
+            || output.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > max_bytes
+            || errors.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > 4_194_304
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{tool} exceeded the processing time or output limit"
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    if output.metadata().map_err(|e| e.to_string())?.len() > max_bytes {
+        return Err(format!("{tool} output exceeds limit"));
+    }
+    let mut stdout = String::new();
+    output.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    output
+        .read_to_string(&mut stdout)
+        .map_err(|e| e.to_string())?;
+    errors.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut stderr = String::new();
+    errors
+        .read_to_string(&mut stderr)
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        let detail: String = stderr.chars().take(2048).collect();
+        return Err(format!("{tool} failed: {detail}"));
+    }
+    Ok((stdout, stderr))
 }
 
 pub fn verified_source(asset: &Asset) -> Result<std::path::PathBuf, String> {
@@ -350,6 +428,7 @@ pub fn import_media(root: &Path, source: &Path) -> Result<Asset, String> {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_millis() as u64,
+            bin: String::new(),
         };
         asset.validate()?;
         asset
@@ -498,6 +577,7 @@ fn read_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         sample_rate: row.get(14)?,
         channels: row.get(15)?,
         created_at: row.get(16)?,
+        bin: String::new(),
     })
 }
 

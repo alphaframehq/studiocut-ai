@@ -1,6 +1,345 @@
 use crate::{media, timeline::Clip, Project};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
+
+/// One detected shot, clip-relative seconds. `score` is a *heuristic*
+/// shot-quality estimate from luma brightness/spread (see
+/// [`score_scene`]) — it is NOT machine learning and does NOT detect
+/// faces, people, or framing; it only says whether a shot looks
+/// normally exposed and textured.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Scene {
+    pub start: f64,
+    pub end: f64,
+    pub score: Option<u32>,
+}
+
+/// A [`Scene`] expressed in timeline frames, as the rough-cut IPC takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneCut {
+    pub start: u32,
+    pub end: u32,
+    pub score: Option<u32>,
+}
+
+/// Result of [`rough_cut`]: ranges to remove, plus the protected hook
+/// (the opening that must never be cut).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoughCut {
+    pub cuts: Vec<Cut>,
+    pub hook: Option<Cut>,
+}
+
+pub fn selected_video(project: &Project, id: Uuid) -> Result<(&media::Asset, &Clip), String> {
+    project.validate()?;
+    let clip = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind != "caption")
+        .flat_map(|t| &t.clips)
+        .find(|c| c.id == id)
+        .ok_or("Select a media clip first")?;
+    let asset = project
+        .assets
+        .iter()
+        .find(|a| a.id == clip.asset_id)
+        .ok_or("Asset not found")?;
+    if asset.video_stream.is_none() {
+        return Err("Selected clip has no video".into());
+    }
+    if clip
+        .effects
+        .as_ref()
+        .and_then(|e| e.finishing.as_ref())
+        .is_some_and(|f| f.speed != 1.0)
+    {
+        return Err("Analyze original-speed video before retiming".into());
+    }
+    Ok((asset, clip))
+}
+
+/// Parse `pts_time:` values out of ffmpeg `showinfo` stderr: one per
+/// frame the `select` filter kept, i.e. one per detected scene change.
+pub fn parse_showinfo(stderr: &str) -> Vec<f64> {
+    let mut times: Vec<f64> = stderr
+        .lines()
+        .filter(|line| line.contains("showinfo"))
+        .filter_map(|line| {
+            let after = line.split("pts_time:").nth(1)?;
+            let token = after
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
+            let value: f64 = token.parse().ok()?;
+            value.is_finite().then_some(value)
+        })
+        .collect();
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+    times
+}
+
+/// Parse per-frame `(frame number, YAVG, spread)` out of ffmpeg
+/// `signalstats` stderr. Two formats are accepted, because FFmpeg
+/// versions differ:
+/// * legacy log lines — `n:0 … YAVG: 118 YSTD: 60` (spread = YSTD);
+/// * `signalstats,metadata=print` lines — `frame:0 pts_time:…` followed
+///   by `lavfi.signalstats.YAVG=…` / `YMAX=` / `YMIN=` (ffmpeg 8 no
+///   longer emits YSTD at all, so spread = YMAX − YMIN).
+/// Lines without a usable YAVG are skipped.
+pub fn parse_signalstats(stderr: &str) -> Vec<(u64, f64, f64)> {
+    let mut frames: std::collections::BTreeMap<u64, (Option<f64>, Option<f64>)> =
+        std::collections::BTreeMap::new();
+    let mut maxima: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+    let mut minima: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+    let number = |line: &str, key: &str| -> Option<f64> {
+        let after = line.split(key).nth(1)?;
+        let token = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
+        token.parse().ok()
+    };
+    let mut current: Option<u64> = None;
+    for line in stderr.lines() {
+        if line.contains("Parsed_metadata") && line.contains("frame:") {
+            current = number(line, "frame:")
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v as u64);
+            continue;
+        }
+        if line.contains("lavfi.signalstats.YAVG=") {
+            if let (Some(n), Some(yavg)) = (current, number(line, "YAVG=")) {
+                frames.entry(n).or_default().0.get_or_insert(yavg);
+            }
+            continue;
+        }
+        if line.contains("lavfi.signalstats.YMAX=") {
+            if let (Some(n), Some(v)) = (current, number(line, "YMAX=")) {
+                maxima.insert(n, v);
+            }
+            continue;
+        }
+        if line.contains("lavfi.signalstats.YMIN=") {
+            if let (Some(n), Some(v)) = (current, number(line, "YMIN=")) {
+                minima.insert(n, v);
+            }
+            continue;
+        }
+        if line.contains("signalstats") && line.contains("YAVG:") {
+            if let (Some(n), Some(yavg), Some(ystd)) = (
+                number(line, "n:"),
+                number(line, "YAVG:"),
+                number(line, "YSTD:"),
+            ) {
+                if n.is_finite() && yavg.is_finite() && ystd.is_finite() && n >= 0.0 {
+                    frames.entry(n as u64).or_default().0.get_or_insert(yavg);
+                    frames.entry(n as u64).or_default().1.get_or_insert(ystd);
+                }
+            }
+        }
+    }
+    frames
+        .into_iter()
+        .filter_map(|(n, (yavg, spread))| {
+            let yavg = yavg?;
+            let spread = spread.or_else(|| match (maxima.get(&n), minima.get(&n)) {
+                (Some(max), Some(min)) => Some((max - min).max(0.0)),
+                _ => None,
+            })?;
+            Some((n, yavg, spread))
+        })
+        .collect()
+}
+
+/// Heuristic shot-quality score 0–100 from mean luma brightness
+/// (`yavg`, ideal ≈ 118) and luma spread (`ystd`: the per-frame YSTD
+/// on older FFmpeg, the YMAX − YMIN range on ffmpeg 8+, where more
+/// spread means more texture, saturating at 60). This is a
+/// brightness/texture heuristic, not ML and not face detection.
+pub fn score_scene(yavg: f64, ystd: f64) -> u32 {
+    let brightness = (1.0 - (yavg - 118.0).abs() / 118.0).clamp(0.0, 1.0);
+    let texture = (ystd / 60.0).min(1.0).max(0.0);
+    (100.0 * (0.6 * brightness + 0.4 * texture)).round() as u32
+}
+
+/// Detect scene boundaries in a video clip with ffmpeg only (no new
+/// dependencies). Pass 1 finds cuts via the `scene` filter; pass 2
+/// scores each scene from per-frame luma stats. Only the first 300 s
+/// of the clip's source range are analysed.
+pub fn detect_scenes(
+    project: &Project,
+    clip_id: Uuid,
+    threshold: f64,
+) -> Result<Vec<Scene>, String> {
+    if !threshold.is_finite() || !(0.1..=0.9).contains(&threshold) {
+        return Err("Scene threshold must be 0.1–0.9 (default 0.4)".into());
+    }
+    let (asset, clip) = selected_video(project, clip_id)?;
+    let fps = project.settings.fps as f64;
+    let source_in = clip.source_in as f64 / fps;
+    let duration = (clip.duration as f64 / fps).min(300.0);
+    if duration <= 0.0 {
+        return Err("Selected clip is too short to analyse".into());
+    }
+    let path = media::verified_source(asset)?;
+    let path = path.to_str().ok_or("Invalid media path")?;
+    let source_in = source_in.to_string();
+    let duration_text = duration.to_string();
+    let stream = asset.video_stream.unwrap();
+    // Pass 1: scene-change boundaries.
+    let (_, showinfo) = media::run_text(
+        "ffmpeg",
+        &[
+            "-nostdin",
+            "-ss",
+            &source_in,
+            "-i",
+            path,
+            "-t",
+            &duration_text,
+            "-map",
+            &format!("0:{stream}"),
+            "-vf",
+            &format!("select='gt(scene,{threshold})',showinfo"),
+            "-f",
+            "null",
+            "-",
+        ],
+        Duration::from_secs(600),
+        8_388_608,
+    )?;
+    let mut boundaries = vec![0.0];
+    for time in parse_showinfo(&showinfo) {
+        if time > 0.001 && time < duration - 0.001 {
+            boundaries.push(time);
+        }
+    }
+    boundaries.push(duration);
+    // Pass 2: per-frame luma stats for the same window. `metadata=print`
+    // is required: on ffmpeg 8 signalstats alone logs no per-frame
+    // lines, it only attaches frame metadata (see parse_signalstats).
+    let frame_fps = asset.fps.filter(|f| *f > 0.0).unwrap_or(fps);
+    let (_, stats) = media::run_text(
+        "ffmpeg",
+        &[
+            "-nostdin",
+            "-ss",
+            &source_in,
+            "-i",
+            path,
+            "-t",
+            &duration_text,
+            "-map",
+            &format!("0:{stream}"),
+            "-vf",
+            "signalstats,metadata=print",
+            "-f",
+            "null",
+            "-",
+        ],
+        Duration::from_secs(600),
+        8_388_608,
+    )?;
+    let frames = parse_signalstats(&stats);
+    let mut scenes = vec![];
+    for window in boundaries.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        let mut yavg_sum = 0.0;
+        let mut ystd_sum = 0.0;
+        let mut count = 0usize;
+        for (n, yavg, ystd) in &frames {
+            let time = *n as f64 / frame_fps;
+            if time >= start && (time < end || (end - duration).abs() < 0.001 && time <= end) {
+                yavg_sum += yavg;
+                ystd_sum += ystd;
+                count += 1;
+            }
+        }
+        let score = if count > 0 {
+            Some(score_scene(
+                yavg_sum / count as f64,
+                ystd_sum / count as f64,
+            ))
+        } else {
+            None
+        };
+        scenes.push(Scene { start, end, score });
+    }
+    Ok(scenes)
+}
+
+fn merge_cuts(mut ranges: Vec<Cut>) -> Vec<Cut> {
+    ranges.sort_by_key(|c| (c.start, c.end));
+    let mut merged: Vec<Cut> = vec![];
+    for cut in ranges {
+        if let Some(last) = merged.last_mut() {
+            if cut.start <= last.end {
+                last.end = last.end.max(cut.end);
+                continue;
+            }
+        }
+        merged.push(cut);
+    }
+    merged
+}
+
+/// Combine silence, filler and low-energy cuts into one rough cut,
+/// protecting the hook: the first 5 s of the best-scored scene when
+/// that scene starts within the first 15 s, otherwise the first 5 s
+/// of the timeline. Scene scores only choose the hook — scene ranges
+/// are never cuts (scenes tile the timeline, so cutting them would
+/// cut everything). Any cut overlapping the hook is dropped.
+pub fn rough_cut(
+    silence: &[Cut],
+    fillers: &[Cut],
+    low_energy: &[Cut],
+    scenes: &[SceneCut],
+    fps: u32,
+) -> RoughCut {
+    let ranges: Vec<Cut> = silence
+        .iter()
+        .chain(fillers)
+        .chain(low_energy)
+        .copied()
+        .collect();
+    let best = scenes
+        .iter()
+        .filter(|s| s.score.is_some())
+        .max_by_key(|s| s.score.unwrap_or(0));
+    let hook_start = match best {
+        Some(scene) if scene.start <= 15 * fps => scene.start,
+        _ => 0,
+    };
+    let hook_end = match best {
+        Some(scene) if scene.start <= 15 * fps => {
+            (scene.start + 5 * fps).min(scene.end.max(scene.start))
+        }
+        _ => 5 * fps,
+    };
+    let hook = if hook_end > hook_start {
+        Some(Cut {
+            start: hook_start,
+            end: hook_end,
+        })
+    } else {
+        None
+    };
+    let cuts = merge_cuts(ranges)
+        .into_iter()
+        .filter(|c| match hook {
+            None => true,
+            Some(h) => c.end <= h.start || c.start >= h.end,
+        })
+        .collect();
+    RoughCut { cuts, hook }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -244,6 +583,141 @@ pub fn ripple(project: &Project, cuts: &[Cut], revision: u64) -> Result<Project,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scene_parsers_score_and_rough_cut() {
+        // showinfo: only pts_time values on showinfo lines count.
+        let stderr = "[Parsed_showinfo_1 @ 0x1] n: 60 pts: 120 pts_time:2.000 pos: 1 fmt:yuv420p\n\
+            [Parsed_select_0 @ 0x2] n: 61 pts_time:9.999\n\
+            [Parsed_showinfo_1 @ 0x1] n: 120 pts: 240 pts_time:4.000 pos: 2 fmt:yuv420p\n";
+        assert_eq!(parse_showinfo(stderr), vec![2.0, 4.0]);
+        assert!(parse_showinfo("").is_empty());
+        // signalstats, legacy log format: only lines with n + YAVG + YSTD count.
+        let stats =
+            "[Parsed_signalstats_0 @ 0x1] n:0 pts:0 YAVG: 118.0 YSTD: 60.0 YMIN: 0 YMAX: 255\n\
+            [Parsed_signalstats_0 @ 0x1] n:1 pts:1 YAVG: 100.0 YSTD: 30.0 YMIN: 0 YMAX: 255\n\
+            [Parsed_signalstats_0 @ 0x1] n:2 pts:2 YAVG: 90.0\n";
+        assert_eq!(
+            parse_signalstats(stats),
+            vec![(0, 118.0, 60.0), (1, 100.0, 30.0)]
+        );
+        // signalstats, ffmpeg 8 metadata=print format: spread is YMAX-YMIN.
+        let meta = "[Parsed_metadata_1 @ 0x1] frame:0    pts:0       pts_time:0\n\
+            [Parsed_metadata_1 @ 0x1] lavfi.signalstats.YMIN=90\n\
+            [Parsed_metadata_1 @ 0x1] lavfi.signalstats.YAVG=118\n\
+            [Parsed_metadata_1 @ 0x1] lavfi.signalstats.YMAX=150\n\
+            [Parsed_metadata_1 @ 0x1] frame:1    pts:512     pts_time:0.0333333\n\
+            [Parsed_metadata_1 @ 0x1] lavfi.signalstats.YMIN=80\n\
+            [Parsed_metadata_1 @ 0x1] lavfi.signalstats.YAVG=100\n\
+            [Parsed_metadata_1 @ 0x1] lavfi.signalstats.YMAX=110\n";
+        assert_eq!(
+            parse_signalstats(meta),
+            vec![(0, 118.0, 60.0), (1, 100.0, 30.0)]
+        );
+        // Ideal brightness + full texture scores 100; black scores low.
+        assert_eq!(score_scene(118.0, 60.0), 100);
+        assert_eq!(score_scene(118.0, 0.0), 60);
+        assert_eq!(score_scene(0.0, 60.0), 40);
+        assert_eq!(score_scene(236.0, 0.0), 0);
+        // Rough cut: overlapping ranges merge; the hook is protected.
+        let fps = 30;
+        let scenes = vec![
+            SceneCut {
+                start: 0,
+                end: 300,
+                score: Some(90),
+            },
+            SceneCut {
+                start: 300,
+                end: 600,
+                score: Some(40),
+            },
+        ];
+        let rough = rough_cut(
+            &[Cut { start: 10, end: 40 }, Cut { start: 35, end: 70 }],
+            &[Cut {
+                start: 200,
+                end: 220,
+            }],
+            &[Cut {
+                start: 400,
+                end: 450,
+            }],
+            &scenes,
+            fps,
+        );
+        // Best scene starts at 0 (within 15 s): hook is its first 5 s.
+        assert_eq!(rough.hook, Some(Cut { start: 0, end: 150 }));
+        // The 10–70 merged range overlaps the hook so it is dropped
+        // whole (cuts are dropped, never trimmed). Scene ranges are
+        // never cuts, so only the filler and low-energy ranges remain.
+        assert_eq!(
+            rough.cuts,
+            vec![
+                Cut {
+                    start: 200,
+                    end: 220
+                },
+                Cut {
+                    start: 400,
+                    end: 450
+                }
+            ]
+        );
+        // Best scene starts after 15 s: hook falls back to the timeline start.
+        let late = rough_cut(
+            &[],
+            &[],
+            &[Cut {
+                start: 200,
+                end: 230,
+            }],
+            &[SceneCut {
+                start: 600,
+                end: 900,
+                score: Some(95),
+            }],
+            fps,
+        );
+        assert_eq!(late.hook, Some(Cut { start: 0, end: 150 }));
+        // The late best scene only picks the hook — its range is not a cut.
+        assert_eq!(
+            late.cuts,
+            vec![Cut {
+                start: 200,
+                end: 230
+            }]
+        );
+        // No scored scenes at all: same timeline-start hook.
+        let unscored = rough_cut(
+            &[Cut {
+                start: 200,
+                end: 230,
+            }],
+            &[],
+            &[],
+            &[SceneCut {
+                start: 0,
+                end: 300,
+                score: None,
+            }],
+            fps,
+        );
+        assert_eq!(unscored.hook, Some(Cut { start: 0, end: 150 }));
+        // No scored scenes: same timeline-start hook, and the silence
+        // range does not overlap it, so it stays.
+        assert_eq!(
+            unscored.cuts,
+            vec![Cut {
+                start: 200,
+                end: 230
+            }]
+        );
+        // Threshold validation.
+        assert!(detect_scenes(&create_project_for_test(), Uuid::new_v4(), 0.05).is_err());
+    }
+    fn create_project_for_test() -> Project {
+        crate::create_project("test".into(), 1920, 1080, 30).unwrap()
+    }
     #[test]
     fn windows_padding_minimum_and_antiphase() {
         let mut d = SilenceDetector::new(SilenceSettings::default()).unwrap();
