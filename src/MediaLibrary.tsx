@@ -6,9 +6,13 @@ import type { Asset } from './project';
 import { attachMedia } from './playback';
 
 type Preview = { thumbnail: number[] | null; peaks: number[] | null };
-function MediaCard({ asset }: { asset: Asset }) {
+function MediaCard({ asset, missing }: { asset: Asset; missing: boolean }) {
+  const { renameAsset, removeAsset, relinkAsset } = useProject();
   const [preview, setPreview] = useState<{ image?: string; peaks?: number[] }>({});
   const [error, setError] = useState('');
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(asset.name);
+  const [relinkPath, setRelinkPath] = useState('');
   useEffect(() => {
     if (!native) return;
     let active = true;
@@ -34,7 +38,10 @@ function MediaCard({ asset }: { asset: Asset }) {
     <p>{[asset.videoCodec, asset.audioCodec, asset.fps ? `${asset.fps.toFixed(2)} fps` : null, asset.sampleRate ? `${asset.sampleRate / 1000} kHz` : null].filter(Boolean).join(' · ')}</p>
     {bars.length > 0 && <svg className="waveform" viewBox={`0 0 ${bars.length * 3} 40`} role="img" aria-label={`Waveform of ${asset.name}`}>{bars.map((peak, i) => <rect key={i} x={i * 3} y={20 - Math.max(1, peak * 19)} width="2" height={Math.max(2, peak * 38)} />)}</svg>}
     {error && <p className="error">{error}</p>}
-    <div className="media-card-actions"><button className="button secondary" onClick={() => { const { edit, frame } = useProject.getState(); void edit({ type: 'addClip', assetId: asset.id, start: Math.round(frame) }); }}>Add to timeline</button><button className="text-button" draggable onDragStart={e => e.dataTransfer.setData('application/studiocut-asset', asset.id)}>Drag to a track</button>{!native && <label>Reattach original for playback<input aria-label={`Reattach ${asset.name}`} type="file" onChange={e => { const file = e.target.files?.[0]; if (file) { try { attachMedia(asset, file); setError(''); useProject.setState({ message: `${asset.name} attached for this session.` }); } catch (error) { setError(String(error)); } } }} /></label>}</div>
+    {missing && <p className="error" role="alert">Source file missing — moved or deleted. Relink it to use this media again.</p>}
+    <div className="media-card-actions"><button className="button secondary" onClick={() => { const { edit, frame } = useProject.getState(); void edit({ type: 'addClip', assetId: asset.id, start: Math.round(frame) }); }}>Add to timeline</button><button className="text-button" draggable onDragStart={e => e.dataTransfer.setData('application/studiocut-asset', asset.id)}>Drag to a track</button><button className="text-button" onClick={() => { setNameDraft(asset.name); setRenaming(!renaming); }}>Rename</button><button className="text-button" onClick={() => { if (window.confirm(`Remove "${asset.name}" from the project? The original file stays untouched. Clips using it must be removed first.`)) void removeAsset(asset.id); }}>Delete</button>{!native && <label>Reattach original for playback<input aria-label={`Reattach ${asset.name}`} type="file" onChange={e => { const file = e.target.files?.[0]; if (file) { try { attachMedia(asset, file); setError(''); useProject.setState({ message: `${asset.name} attached for this session.` }); } catch (error) { setError(String(error)); } } }} /></label>}</div>
+    {renaming && <form className="media-rename" onSubmit={e => { e.preventDefault(); if (nameDraft.trim() && nameDraft.trim() !== asset.name) void renameAsset(asset.id, nameDraft.trim()); setRenaming(false); }}><label>Rename media<input aria-label={`Rename ${asset.name}`} value={nameDraft} onChange={e => setNameDraft(e.target.value)} maxLength={120} /></label><button className="button secondary" type="submit">Save name</button><button className="text-button" type="button" onClick={() => setRenaming(false)}>Cancel</button></form>}
+    {missing && native && <form className="media-relink" onSubmit={e => { e.preventDefault(); if (relinkPath.trim()) void relinkAsset(asset.id, relinkPath.trim()); }}><label>New location (absolute path)<input aria-label={`Relink ${asset.name}`} value={relinkPath} onChange={e => setRelinkPath(e.target.value)} placeholder="/new/location/clip.mp4" spellCheck={false} /></label><button className="button secondary" type="submit" disabled={!relinkPath.trim()}>Relink</button></form>}
   </article>;
 }
 
@@ -43,6 +50,13 @@ export function MediaLibrary() {
   const [paths, setPaths] = useState('');
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState<'all' | 'video' | 'audio' | 'image'>('all');
+  const [missing, setMissing] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!native || !project) { setMissing(new Set()); return; }
+    let active = true;
+    void invoke<string[]>('media_missing').then(ids => { if (active) setMissing(new Set(ids)); }).catch(() => { if (active) setMissing(new Set()); });
+    return () => { active = false; };
+  }, [project?.id, project?.revision]);
   if (!project) return <div className="media-empty"><div className="stack-icon"><Film size={24} /></div><h3>A home for your footage</h3><p>Create a project to start organizing your next edit.</p><span className="small-tag">NON-DESTRUCTIVE BY DESIGN</span></div>;
   const visible = project.assets.filter(a => (kind === 'all' || a.kind === kind) && a.name.toLowerCase().includes(query.trim().toLowerCase()));
   return <div className="media-library">
@@ -50,6 +64,6 @@ export function MediaLibrary() {
     {native ? <details><summary>Import by local path</summary><form onSubmit={e => { e.preventDefault(); void importMedia(paths.split('\n').map(p => p.trim()).filter(Boolean)); }}><label htmlFor="media-paths">Absolute file paths, one per line</label><textarea id="media-paths" value={paths} onChange={e => setPaths(e.target.value)} rows={3} required /><button className="button secondary" disabled={busy || !paths.trim()}>Import paths</button></form></details> : <p className="import-note">Media import requires the desktop app with FFmpeg and FFprobe installed. Browser preview can play media reattached to an opened project.</p>}
     <p className="import-note">{busy ? 'Processing… Long audio can take several minutes.' : 'Video, audio and images · up to 6 hours per file. Originals stay untouched.'}</p>
     {project.assets.length > 0 && <div className="media-filter" role="search"><input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search media by name…" aria-label="Search media by name" /><select value={kind} onChange={e => setKind(e.target.value as typeof kind)} aria-label="Filter media by kind"><option value="all">All kinds</option><option value="video">Video</option><option value="audio">Audio</option><option value="image">Images</option></select><span aria-live="polite">{visible.length} of {project.assets.length}</span></div>}
-    {project.assets.length ? (visible.length ? <div className="media-list">{visible.map(asset => <MediaCard key={`${asset.id}:${project.revision}`} asset={asset} />)}</div> : <div className="media-empty"><Film size={24} /><h3>No matches</h3><p>Nothing in the bin matches that search or filter. Clear it to see all {project.assets.length} assets.</p></div>) : <div className="media-empty"><Film size={24} /><h3>No media yet</h3><p>Import footage to inspect metadata, thumbnails and waveforms.</p></div>}
+    {project.assets.length ? (visible.length ? <div className="media-list">{visible.map(asset => <MediaCard key={`${asset.id}:${project.revision}`} asset={asset} missing={missing.has(asset.id)} />)}</div> : <div className="media-empty"><Film size={24} /><h3>No matches</h3><p>Nothing in the bin matches that search or filter. Clear it to see all {project.assets.length} assets.</p></div>) : <div className="media-empty"><Film size={24} /><h3>No media yet</h3><p>Import footage to inspect metadata, thumbnails and waveforms.</p></div>}
   </div>;
 }
