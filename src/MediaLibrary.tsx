@@ -41,11 +41,15 @@ function MediaCard({ asset }: { asset: Asset }) {
 export function MediaLibrary() {
   const { project, busy, importMedia } = useProject();
   const [paths, setPaths] = useState('');
+  const [query, setQuery] = useState('');
+  const [kind, setKind] = useState<'all' | 'video' | 'audio' | 'image'>('all');
   if (!project) return <div className="media-empty"><div className="stack-icon"><Film size={24} /></div><h3>A home for your footage</h3><p>Create a project to start organizing your next edit.</p><span className="small-tag">NON-DESTRUCTIVE BY DESIGN</span></div>;
+  const visible = project.assets.filter(a => (kind === 'all' || a.kind === kind) && a.name.toLowerCase().includes(query.trim().toLowerCase()));
   return <div className="media-library">
     <button className="button secondary" disabled={busy || !native} onClick={() => void importMedia()}><Plus size={15} />Import media</button>
     {native ? <details><summary>Import by local path</summary><form onSubmit={e => { e.preventDefault(); void importMedia(paths.split('\n').map(p => p.trim()).filter(Boolean)); }}><label htmlFor="media-paths">Absolute file paths, one per line</label><textarea id="media-paths" value={paths} onChange={e => setPaths(e.target.value)} rows={3} required /><button className="button secondary" disabled={busy || !paths.trim()}>Import paths</button></form></details> : <p className="import-note">Media import requires the desktop app with FFmpeg and FFprobe installed. Browser preview can play media reattached to an opened project.</p>}
     <p className="import-note">{busy ? 'Processing… Long audio can take several minutes.' : 'Video, audio and images · up to 6 hours per file. Originals stay untouched.'}</p>
-    {project.assets.length ? <div className="media-list">{project.assets.map(asset => <MediaCard key={`${asset.id}:${project.revision}`} asset={asset} />)}</div> : <div className="media-empty"><Film size={24} /><h3>No media yet</h3><p>Import footage to inspect metadata, thumbnails and waveforms.</p></div>}
+    {project.assets.length > 0 && <div className="media-filter" role="search"><input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search media by name…" aria-label="Search media by name" /><select value={kind} onChange={e => setKind(e.target.value as typeof kind)} aria-label="Filter media by kind"><option value="all">All kinds</option><option value="video">Video</option><option value="audio">Audio</option><option value="image">Images</option></select><span aria-live="polite">{visible.length} of {project.assets.length}</span></div>}
+    {project.assets.length ? (visible.length ? <div className="media-list">{visible.map(asset => <MediaCard key={`${asset.id}:${project.revision}`} asset={asset} />)}</div> : <div className="media-empty"><Film size={24} /><h3>No matches</h3><p>Nothing in the bin matches that search or filter. Clear it to see all {project.assets.length} assets.</p></div>) : <div className="media-empty"><Film size={24} /><h3>No media yet</h3><p>Import footage to inspect metadata, thumbnails and waveforms.</p></div>}
   </div>;
 }
