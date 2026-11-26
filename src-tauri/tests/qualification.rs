@@ -79,6 +79,7 @@ fn export(project: &Project, root: &Path, name: &str, encoder: &str) -> Snapshot
                 height: 1080,
                 fps: 30,
                 encoder: encoder.into(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -438,7 +439,8 @@ fn mastering_matches_reference_and_ducks_music_under_voice() {
                 container: "mp4".into(),
                 height: 1080,
                 fps: 30,
-                encoder: "libx264".into()
+                encoder: "libx264".into(),
+                ..Default::default()
             }
         )
         .unwrap()

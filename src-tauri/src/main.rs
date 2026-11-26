@@ -545,7 +545,7 @@ async fn save_project(
         Ok(Some(path.to_string_lossy().into_owned()))
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     if let Some(ref path) = saved {
         // Remember the file for autosave; a successful manual save makes
         // any crash-recovery backup obsolete.
@@ -581,7 +581,7 @@ async fn save_project_silent(state: State<'_, Workspace>) -> Result<Option<Strin
         Ok(path.to_string_lossy().into_owned())
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     Ok(Some(saved))
 }
 

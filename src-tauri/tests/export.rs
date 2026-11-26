@@ -21,6 +21,7 @@ fn settings() -> ExportSettings {
         height: 1080,
         fps: 30,
         encoder: "libx264".into(),
+        ..Default::default()
     }
 }
 fn fixture(root: &Path) -> studiocut_ai::Project {
@@ -327,6 +328,7 @@ fn mov_4k_frame_rates_solo_and_persisted_finishing() {
             height,
             fps,
             encoder: "hevc_videotoolbox".into(),
+            ..Default::default()
         };
         let output = root.path().join(format!("short-{fps}.{container}"));
         let job = manager
