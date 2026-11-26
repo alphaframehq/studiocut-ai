@@ -2,6 +2,7 @@ import { StrictMode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ArrowRight, Clapperboard, FolderOpen, HardDrive, LockKeyhole, Plus, Save, Scissors, ShieldCheck, Sparkles, X } from 'lucide-react';
 import { native, useProject } from './store';
+import './design-tokens.css';
 import './styles.css';
 import './analysis.css';
 import { MediaLibrary } from './MediaLibrary';

@@ -1,0 +1,108 @@
+/* StudioCut AI — Design Tokens (single source of truth)
+ *
+ * Every color, type size, radius, shadow and motion value in the app comes
+ * from here. Panel stylesheets (styles.css, analysis.css, director.css,
+ * finishing.css) reference these variables — never hard-code a hex value in
+ * a component stylesheet. See STYLE_GUIDE.md for the full kit.
+ *
+ * Values are intentionally identical to the original palette (dark studio
+ * theme, mint accent) so the token migration changes no visuals by itself;
+ * the visual unification (one dark theme everywhere) lives in the panel
+ * stylesheets that consume these tokens.
+ */
+
+:root {
+  /* --- Color: surfaces (dark studio) --- */
+  --color-bg: #111516; /* app background */
+  --color-bg-deep: #0e1213; /* darkest backdrop (viewer, dialogs backdrop) */
+  --color-surface: #181d1e; /* cards, panels */
+  --color-surface-elevated: #1d2324; /* toolbars, raised panels */
+  --color-surface-sunken: #101616; /* viewer wells, media art */
+  --color-input: #101514; /* text inputs, selects, textareas */
+  --color-input-strong: #111a15; /* dialogs' inputs */
+
+  /* --- Color: borders --- */
+  --color-border: #2a3233; /* default hairline */
+  --color-border-strong: #394342; /* inputs, emphasized dividers */
+  --color-border-accent: #4b6256; /* accent-tinted border (badges, active tabs) */
+
+  /* --- Color: text --- */
+  --color-text: #e9edeb; /* primary */
+  --color-text-soft: #d0ddd7; /* secondary headings */
+  --color-text-muted: #9aa6a4; /* body muted, labels */
+  --color-text-faint: #65736f; /* icons, disabled hints */
+
+  /* --- Color: brand accents --- */
+  --color-accent: #b8e4cd; /* mint — primary accent (buttons, focus, active) */
+  --color-accent-strong: #d1f1df; /* mint hover */
+  --color-accent-ink: #1b3025; /* text on a filled mint surface */
+  --color-accent-soft: #a9d9bb; /* status dots, soft highlights */
+  --color-accent-dim: #a6c7b2; /* secondary accent text */
+  --color-gold: #e8c87a; /* VIP gold — premium/AI highlights only, sparingly */
+  --color-gold-ink: #2b2113;
+  --color-violet: #b7a6e8; /* analysis section accent (captions, focus in analysis) */
+  --color-violet-deep: #8b6fd0;
+
+  /* --- Color: feedback --- */
+  --color-focus: #b8e4cd; /* focus ring everywhere (same as accent) */
+  --color-error: #f6b6a9;
+  --color-error-strong: #e8a1a1;
+  --color-warning-bg: #3a3023;
+  --color-warning-border: #7b6544;
+  --color-warning-text: #f0dab6;
+
+  /* --- Color: timeline --- */
+  --color-clip-video: #638052;
+  --color-clip-video-border: #b5ca91;
+  --color-clip-audio: #405e64;
+  --color-clip-audio-border: #769b9d;
+  --color-clip-caption-bg: #3a2f5e;
+  --color-clip-caption-border: #8b6fd0;
+  --color-playhead: #e8f4bd;
+  --color-track: #1b2e21;
+
+  /* --- Typography --- */
+  --font-sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Scale: 11px is the smallest text allowed (eyebrows/tags only).
+     Body copy is 12–13px; never set 8–10px body text on new components. */
+  --text-eyebrow: 9px;
+  --text-caption: 10px;
+  --text-sm: 11px;
+  --text-base: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+  --text-2xl: 21px;
+  --text-hero: 25px;
+
+  /* --- Spacing --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* --- Radii --- */
+  --radius-sm: 5px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --radius-dialog: 14px;
+
+  /* --- Shadows --- */
+  --shadow-card: 0 12px 35px #0002;
+  --shadow-dialog: 0 25px 100px #0008;
+  --shadow-pop: 0 24px 60px #000a;
+
+  /* --- Motion --- */
+  --motion-fast: 0.15s ease;
+  --motion-base: 0.2s ease;
+
+  /* --- Legacy aliases (kept so older rules keep working) --- */
+  --muted: var(--color-text-muted);
+  --line: var(--color-border);
+  --mint: var(--color-accent);
+}
