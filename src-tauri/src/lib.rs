@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -32,6 +32,14 @@ pub struct Settings {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Marker {
+    pub id: Uuid,
+    pub frame: u32,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Project {
     pub schema_version: u32,
     pub id: Uuid,
@@ -41,6 +49,9 @@ pub struct Project {
     pub settings: Settings,
     pub assets: Vec<media::Asset>,
     pub tracks: Vec<timeline::Track>,
+    /// Timeline markers. Optional so v1–v6 files load with an empty list.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
 }
 
 impl Project {
@@ -73,6 +84,21 @@ impl Project {
                 return Err("Duplicate project asset".into());
             }
         }
+        if self.markers.len() > 200 {
+            return Err("Maximum 200 timeline markers".into());
+        }
+        let mut marker_ids = std::collections::HashSet::new();
+        let max_frame = 21600 * 60;
+        for marker in &self.markers {
+            if marker.id.get_version_num() != 4
+                || !marker_ids.insert(marker.id)
+                || marker.frame > max_frame
+                || marker.label.trim().is_empty()
+                || marker.label.encode_utf16().count() > 80
+            {
+                return Err("Invalid timeline marker".into());
+            }
+        }
         Ok(())
     }
 }
@@ -95,6 +121,7 @@ pub fn create_project(name: String, width: u32, height: u32, fps: u32) -> Result
         },
         assets: vec![],
         tracks: vec![],
+        markers: vec![],
     };
     project.validate()?;
     Ok(project)
@@ -113,6 +140,17 @@ pub fn load_project(path: &Path) -> Result<Project, String> {
         serde_json::from_slice(&bytes).map_err(|e| format!("Invalid project: {e}"))?;
     project.validate()?;
     Ok(project)
+}
+
+/// Sibling crash-recovery backup: `My Cut.studiocut` ->
+/// `My Cut.autosave.studiocut`. Same extension, so it stays a valid
+/// project file that `load_project` can read back.
+pub fn autosave_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    path.with_file_name(format!("{stem}.autosave.studiocut"))
 }
 
 pub fn save_project(project: &Project, path: &Path) -> Result<(), String> {
@@ -147,4 +185,15 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), String> {
         .and_then(|directory| directory.sync_all())
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn autosave_path_is_a_valid_sibling_project_name() {
+        let path = autosave_path(Path::new("/tmp/My Cut.studiocut"));
+        assert_eq!(path, Path::new("/tmp/My Cut.autosave.studiocut"));
+        assert_eq!(path.extension().and_then(|s| s.to_str()), Some("studiocut"));
+    }
 }
