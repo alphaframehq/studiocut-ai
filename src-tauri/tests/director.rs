@@ -245,7 +245,8 @@ fn provider_contracts_context_limits_and_missing_credentials() {
             &p,
             config.clone(),
             "Edit".into(),
-            true
+            true,
+            "edit",
         )
         .err()
         .unwrap()
@@ -256,7 +257,8 @@ fn provider_contracts_context_limits_and_missing_credentials() {
             &p,
             config.clone(),
             "Edit".into(),
-            false
+            false,
+            "edit",
         )
         .err()
         .unwrap()

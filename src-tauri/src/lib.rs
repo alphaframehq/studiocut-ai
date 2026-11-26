@@ -8,6 +8,7 @@ pub mod license;
 pub mod media;
 pub mod progress_channel;
 pub mod render;
+pub mod thumbnail;
 pub mod timeline;
 pub mod transcription;
 use serde::{Deserialize, Serialize};

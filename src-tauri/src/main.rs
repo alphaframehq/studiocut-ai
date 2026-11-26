@@ -136,17 +136,59 @@ async fn director_propose(
     config: studiocut_ai::director::Config,
     instruction: String,
     consent: bool,
+    mode: String,
 ) -> Result<studiocut_ai::director::Proposal, String> {
     use tauri::Manager;
     license_gate(&app)?;
+    if mode != "edit" && mode != "titles" {
+        return Err("Director mode must be \"edit\" or \"titles\"".into());
+    }
     let project = analysis_snapshot(&state, project_id, revision)?;
     tauri::async_runtime::spawn_blocking(move || {
         let ai = app.state::<AiState>();
-        ai.director
-            .propose(&ai.credentials, &project, config, instruction, consent)
+        ai.director.propose(
+            &ai.credentials,
+            &project,
+            config,
+            instruction,
+            consent,
+            mode.as_str(),
+        )
     })
     .await
     .map_err(|_| "Director task failed".to_string())?
+}
+
+/// List chat models for a Director provider. The API key is per-call
+/// only — it is never stored. Static lists (Claude/Bedrock) and the
+/// empty Vertex list come with a note; see director::list_director_models.
+#[tauri::command]
+async fn list_director_models(
+    request: studiocut_ai::director::DirectorModelsRequest,
+) -> Result<studiocut_ai::director::DirectorModelsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::director::list_director_models(&request)
+    })
+    .await
+    .map_err(|_| "Director model list failed".to_string())?
+}
+
+/// Grab one PNG frame from a video clip at `at_seconds` (seconds into
+/// the clip) and return it as a base64 data URL.
+#[tauri::command]
+async fn extract_thumbnail(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    at_seconds: f64,
+) -> Result<String, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::thumbnail::extract_thumbnail(&project, clip_id, at_seconds)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -176,6 +218,105 @@ async fn detect_silence(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Scene detection (heuristic — ffmpeg scene filter + luma stats, no
+/// ML, no face detection). Threshold 0.1–0.9, default 0.4.
+#[tauri::command]
+async fn detect_scenes(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    threshold: f64,
+) -> Result<Vec<studiocut_ai::analysis::Scene>, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::analysis::detect_scenes(&project, clip_id, threshold)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Filler-word cuts for a word-timestamped transcript. The language is
+/// not passed: both the English and Hindi/Hinglish filler sets apply,
+/// so a mixed transcript is covered either way.
+#[tauri::command]
+async fn detect_filler_cuts(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    words: Vec<studiocut_ai::transcription::TimedText>,
+) -> Result<Vec<studiocut_ai::analysis::Cut>, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::transcription::filler_cuts(&project, clip_id, &words, "")
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Auto rough cut: merges silence, filler and low-energy cuts the
+/// user already ran, protecting the hook (scene scores pick the hook;
+/// see analysis::rough_cut). Pure combination — it does not re-run
+/// transcription or silence.
+#[tauri::command]
+fn rough_cut(
+    state: State<Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    silence: Vec<studiocut_ai::analysis::Cut>,
+    fillers: Vec<studiocut_ai::analysis::Cut>,
+    low_energy: Vec<studiocut_ai::analysis::Cut>,
+    scenes: Vec<studiocut_ai::analysis::SceneCut>,
+) -> Result<studiocut_ai::analysis::RoughCut, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    let total = silence.len() + fillers.len() + low_energy.len() + scenes.len();
+    if total > 2000
+        || silence
+            .iter()
+            .chain(&fillers)
+            .chain(&low_energy)
+            .any(|c| c.start >= c.end)
+        || scenes.iter().any(|s| s.start >= s.end)
+    {
+        return Err("Rough-cut inputs must be valid ranges (at most 2000 total)".into());
+    }
+    Ok(studiocut_ai::analysis::rough_cut(
+        &silence,
+        &fillers,
+        &low_energy,
+        &scenes,
+        project.settings.fps,
+    ))
+}
+
+/// Move one media asset into a named bin ("" = Unsorted). Bins live in
+/// the project file only; a reimport/relink resets the bin.
+#[tauri::command]
+fn set_asset_bin(
+    state: State<Workspace>,
+    asset_id: uuid::Uuid,
+    bin: String,
+) -> Result<Project, String> {
+    let bin = bin.trim().to_string();
+    if bin.contains('\0') || bin.encode_utf16().count() > 80 {
+        return Err("Bin name must be 1–80 characters".into());
+    }
+    let mut current = state.0.lock().map_err(|e| e.to_string())?;
+    let project = current.as_ref().ok_or("No project is open")?;
+    let mut next = project.clone();
+    let asset = next
+        .assets
+        .iter_mut()
+        .find(|a| a.id == asset_id)
+        .ok_or("Media not found")?;
+    asset.bin = bin;
+    next.revision = next.revision.checked_add(1).ok_or("Revision overflow")?;
+    next.validate()?;
+    *current = Some(next.clone());
+    Ok(next)
 }
 
 #[tauri::command]
@@ -879,6 +1020,8 @@ fn main() {
             director_context,
             director_credential,
             director_propose,
+            list_director_models,
+            extract_thumbnail,
             director_apply,
             create_project,
             open_project,
@@ -900,6 +1043,10 @@ fn main() {
             playback_source,
             audio_chunk,
             detect_silence,
+            detect_scenes,
+            detect_filler_cuts,
+            rough_cut,
+            set_asset_bin,
             ripple_delete,
             transcription_status,
             list_transcription_models,
