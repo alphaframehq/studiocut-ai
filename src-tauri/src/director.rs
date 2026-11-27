@@ -1,4 +1,5 @@
 use crate::{
+    agents::{EdlDiff, GradeSuggestion, QaDrop},
     credentials::{Credentials, Provider},
     edl::{self, Edl},
     Project,
@@ -89,7 +90,60 @@ impl Config {
 }
 /// System prompt for `titles` mode: titles and hooks, not an EDL. Plain
 /// text out, so no JSON schema is attached to the request.
-pub const TITLES_SYSTEM: &str = "You are a short-form video title and hook writer. Return plain text only, no JSON, no markdown fences: first 5 numbered video titles (each under 60 characters), then a blank line, then 3 numbered opening hooks (each one spoken sentence, under 15 words). Base titles and hooks only on the supplied project context — asset names and transcript. Do not invent people, claims or footage that is not in the context. No preamble, no explanation.";
+pub const TITLES_SYSTEM: &str = "You are a short-form video title and hook writer. Return plain text only, no JSON, no markdown fences: use exactly these section headers, in this order: ## Titles — 5 numbered video titles (each under 60 characters); ## Hooks — 3 numbered opening hooks (each one spoken sentence, under 15 words); ## Description — one description (2 sentences, under 280 characters); ## Platform variants — one title each for YouTube long, Shorts, Reels and TikTok (each under 60 characters), one per line formatted `YouTube: ...`, `Shorts: ...`, `Reels: ...`, `TikTok: ...`. Base titles and hooks only on the supplied project context — asset names and transcript. Do not invent people, claims or footage that is not in the context. No preamble, no explanation.";
+
+/// The Director's plan for an edit proposal: one short string per aspect.
+/// The model returns it alongside the EDL; all fields default to empty
+/// when the model omits them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Plan {
+    #[serde(default)]
+    pub pace: String,
+    #[serde(default)]
+    pub cuts: String,
+    #[serde(default)]
+    pub captions: String,
+    #[serde(default)]
+    pub grade: String,
+    #[serde(default)]
+    pub music: String,
+}
+
+/// What the model returns for an edit proposal: a plan plus the EDL.
+/// Ollama's format constraint may still force a bare EDL, so
+/// [`parse_proposal_response`] falls back to that shape.
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposalResponse {
+    #[serde(default)]
+    pub plan: Option<Plan>,
+    pub edl: Edl,
+}
+
+/// A previous proposal a follow-up revises: its id, its EDL and the
+/// summary the user saw. The summary travels in the prompt so the model
+/// can refer to what was proposed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviousProposal {
+    pub id: String,
+    pub edl: Edl,
+    pub summary: String,
+}
+
+/// Parse a model reply into an EDL and an optional plan: try the
+/// `{"plan", "edl"}` wrapper first, then fall back to a bare EDL.
+pub fn parse_proposal_response(text: &str) -> Result<(Edl, Option<Plan>), String> {
+    if text.len() > 262144 {
+        return Err("EDL exceeds 256 KB".into());
+    }
+    if let Ok(wrapped) = serde_json::from_str::<ProposalResponse>(text) {
+        return Ok((wrapped.edl, wrapped.plan));
+    }
+    let edl = edl::parse(text)?;
+    Ok((edl, None))
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -492,6 +546,23 @@ pub struct Proposal {
     /// Plain-text answer for `titles` mode; `None` for edit proposals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The model's plan (pace, cuts, captions, grade, music), if supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
+    /// Operations QA removed before compile, with reasons. Empty when
+    /// nothing was dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qa_dropped: Vec<QaDrop>,
+    /// Index-based diff against the previous proposal's EDL, only when
+    /// this proposal revises one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<EdlDiff>,
+    /// Grade suggestion derived from the plan's grade text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade_suggestion: Option<GradeSuggestion>,
+    /// Caption preset picked from the plan's captions text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_preset: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -517,7 +588,7 @@ impl Drop for Guard<'_> {
 }
 
 pub fn request_body(config: &Config, prompt: &str) -> Value {
-    let schema = schemars::schema_for!(Edl);
+    let schema = schemars::schema_for!(ProposalResponse);
     let system = format!(
         "{PROMPT}\nEDL JSON schema: {}",
         serde_json::to_string(&schema).unwrap()
@@ -582,6 +653,8 @@ impl Director {
         instruction: String,
         consent: bool,
         mode: &str,
+        previous: Option<PreviousProposal>,
+        learned_preferences: Option<String>,
     ) -> Result<Proposal, String> {
         if self.0.swap(true, Ordering::AcqRel) {
             return Err("A Director request is already running".into());
@@ -602,8 +675,16 @@ impl Director {
         if context.bytes > 96000 {
             return Err("Context exceeds 96 KB; use a smaller project".into());
         }
-        let prompt =
-            json!({"instruction":instruction,"untrustedProjectContext":context.data}).to_string();
+        let mut prompt_value =
+            json!({"instruction":instruction,"untrustedProjectContext":context.data});
+        if let Some(previous) = &previous {
+            prompt_value["previousProposal"] =
+                json!({"id":previous.id,"edl":previous.edl,"summary":previous.summary});
+        }
+        if let Some(preferences) = &learned_preferences {
+            prompt_value["learnedPreferences"] = json!(preferences);
+        }
+        let prompt = prompt_value.to_string();
         let titles = mode == "titles";
         let body = if titles {
             titles_body(&config, &prompt)
@@ -660,11 +741,35 @@ impl Director {
                 summary: "Titles & hooks".into(),
                 operations: vec![],
             };
-            return Ok(Proposal { edl, text: Some(text), trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:2, estimated_cost:None, request_body:body, tool_calls:vec![] } });
+            return Ok(Proposal { edl, text: Some(text), plan: None, qa_dropped: vec![], diff: None, grade_suggestion: None, caption_preset: None, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:3, estimated_cost:None, request_body:body, tool_calls:vec![] } });
         }
-        let edl = edl::parse(&text)?;
-        edl::compile(project, &edl)?;
-        Ok(Proposal { edl, text: None, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:1, estimated_cost:None, request_body:body, tool_calls:vec![] } })
+        let (mut edl, plan) = parse_proposal_response(&text)?;
+        // QA runs after parse, before compile, on the parsed EDL.
+        let (kept, qa_dropped) = crate::agents::qa_validate(project, &edl);
+        edl.operations = kept;
+        let diff = previous
+            .as_ref()
+            .map(|previous| crate::agents::diff_edls(&previous.edl, &edl));
+        let caption_preset = plan
+            .as_ref()
+            .map(|plan| crate::agents::pick_caption_preset(&plan.captions).to_string());
+        let grade_suggestion = plan
+            .as_ref()
+            .map(|plan| crate::agents::grade_suggestion(&plan.grade));
+        if edl.operations.is_empty() {
+            // QA dropped everything: still return the proposal with a
+            // note, never an error.
+            if !qa_dropped.is_empty() {
+                edl.summary = format!(
+                    "{} [QA removed {} operation(s) that would have failed validation]",
+                    edl.summary,
+                    qa_dropped.len()
+                );
+            }
+        } else {
+            edl::compile(project, &edl)?;
+        }
+        Ok(Proposal { edl, text: None, plan, qa_dropped, diff, grade_suggestion, caption_preset, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:3, estimated_cost:None, request_body:body, tool_calls:vec![] } })
     }
 }
 
@@ -809,6 +914,26 @@ mod tests {
             endpoint: "".into(),
         });
         assert!(missing_key.is_err());
+    }
+    #[test]
+    fn parse_proposal_response_wrapper_and_bare_edl_fallback() {
+        let project_id = uuid::Uuid::new_v4();
+        let bare = format!(
+            r#"{{"version":1,"projectId":"{project_id}","baseRevision":0,"summary":"Trim the silence","operations":[]}}"#
+        );
+        let (edl, plan) = parse_proposal_response(&bare).unwrap();
+        assert_eq!(edl.summary, "Trim the silence");
+        assert!(plan.is_none());
+        let wrapped = format!(
+            r#"{{"plan":{{"pace":"tight 2s shots","cuts":"remove dead air","captions":"bold hormozi","grade":"warm, more contrast","music":"duck under voice"}},"edl":{bare}}}"#
+        );
+        let (edl, plan) = parse_proposal_response(&wrapped).unwrap();
+        assert_eq!(edl.summary, "Trim the silence");
+        let plan = plan.unwrap();
+        assert_eq!(plan.pace, "tight 2s shots");
+        assert_eq!(plan.grade, "warm, more contrast");
+        assert!(parse_proposal_response("not json at all").is_err());
+        assert!(parse_proposal_response("").is_err());
     }
     #[test]
     fn titles_body_has_no_edl_schema() {
