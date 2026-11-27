@@ -4,13 +4,14 @@ import { useProject } from './store';
 import { audible } from './timeline';
 
 type ScopeData = {
-  sampleWidth: number; sampleHeight: number; approximate: boolean;
+  sampleWidth: number; sampleHeight: number; approximate: boolean; fullResolution: boolean;
   waveform: [number, number][]; histogramLuma: number[];
   histogramRed: number[]; histogramGreen: number[]; histogramBlue: number[];
   vectorscope: number[]; vectorscopePeak: number;
 };
 
 const APPROXIMATION_NOTE = 'Approximate — computed from a sample frame no wider than 320 px. Use as a grading aid, not a broadcast measurement.';
+const FULL_RESOLUTION_NOTE = 'Full-resolution sampling active — the native frame is analysed, with no downscaling. Slower on large sources. Still a grading aid, not a broadcast measurement.';
 
 function drawWaveform(canvas: HTMLCanvasElement, scopes: ScopeData) {
   const ctx = canvas.getContext('2d');
@@ -107,6 +108,7 @@ export function ScopesPanel() {
   const [scopes, setScopes] = useState<ScopeData | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [fullResolution, setFullResolution] = useState(false);
   const waveformRef = useRef<HTMLCanvasElement>(null);
   const histogramRef = useRef<HTMLCanvasElement>(null);
   const vectorscopeRef = useRef<HTMLCanvasElement>(null);
@@ -119,13 +121,13 @@ export function ScopesPanel() {
     if (!project || !active || !asset) { setScopes(null); return; }
     setBusy(true);
     const timer = setTimeout(() => {
-      void invoke<ScopeData>('analyze_scopes', { projectId: project.id, revision: project.revision, clipId: active.id, atSeconds })
+      void invoke<ScopeData>('analyze_scopes', { projectId: project.id, revision: project.revision, clipId: active.id, atSeconds, fullResolution })
         .then(result => { setScopes(result); setError(''); })
         .catch(e => setError(String(e)))
         .finally(() => setBusy(false));
     }, 400);
     return () => clearTimeout(timer);
-  }, [project?.id, project?.revision, active?.id, frame]);
+  }, [project?.id, project?.revision, active?.id, frame, fullResolution]);
 
   useEffect(() => {
     if (!scopes) return;
@@ -139,13 +141,14 @@ export function ScopesPanel() {
     setBusy(true);
     setError('');
     try {
-      setScopes(await invoke<ScopeData>('analyze_scopes', { projectId: project.id, revision: project.revision, clipId: active.id, atSeconds }));
+      setScopes(await invoke<ScopeData>('analyze_scopes', { projectId: project.id, revision: project.revision, clipId: active.id, atSeconds, fullResolution }));
     } catch (e) { setError(String(e)); } finally { setBusy(false); }
   };
 
   return <section className="scopes-panel" aria-label="Colour scopes">
     <header><strong>Scopes</strong><span>WAVEFORM · HISTOGRAM · VECTORSCOPE</span></header>
-    <p className="finish-note">{APPROXIMATION_NOTE}</p>
+    <p className="finish-note">{fullResolution ? FULL_RESOLUTION_NOTE : APPROXIMATION_NOTE}</p>
+    <label className="finish-note" style={{ display: 'flex', gap: 8, alignItems: 'center' }}><input type="checkbox" checked={fullResolution} onChange={e => setFullResolution(e.target.checked)} />Full-resolution sampling (slower — analyses the native frame instead of a 320 px sample)</label>
     {asset ? <p className="finish-note">Frame at the playhead — {asset.name} · {scopes ? `${scopes.sampleWidth} × ${scopes.sampleHeight} sample frame` : 'sampling…'}</p> : <p className="finish-note">Place the playhead over a video clip to inspect its frame.</p>}
     {error && <p className="error" role="alert">{error}</p>}
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
@@ -156,6 +159,7 @@ export function ScopesPanel() {
     <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
       <button className="button secondary" onClick={() => void refresh()} disabled={busy || !active}>{busy ? 'Sampling…' : 'Refresh scopes'}</button>
       {scopes?.approximate && <span className="finish-note" style={{ alignSelf: 'center' }}>Approximate — downscaled sample frame</span>}
+      {scopes?.fullResolution && <span className="finish-note" style={{ alignSelf: 'center' }}>Full resolution — native frame, no downscaling</span>}
     </div>
   </section>;
 }

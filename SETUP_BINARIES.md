@@ -6,11 +6,14 @@ app uses — `ffmpeg`, `ffprobe`, `whisper-cli` (whisper.cpp) and its GGML model
 on Windows, macOS and Linux.
 
 The app must be able to find each binary on `PATH`, or you can point at exact
-locations:
+locations. The installed app ships its own `ffmpeg` and `ffprobe` sidecars
+next to the executable; those bundled binaries are used first. If no sidecar
+is present, the resolution order is:
 
-- **ffmpeg / ffprobe** — the Rust backend spawns them by name. If they are not on
-  `PATH`, export `FFMPEG_PATH` / `FFPROBE_PATH` with the absolute binary path
-  before launching StudioCut.
+- **ffmpeg / ffprobe** — the Rust backend resolves them in this order:
+  bundled sidecar next to the app executable, then `FFMPEG_PATH` /
+  `FFPROBE_PATH` with the absolute binary path, then the bare `ffmpeg` /
+  `ffprobe` on `PATH`.
 - **whisper-cli** — configured in **Settings › Transcription** as a path or
   command; the **Check availability** button verifies it immediately.
 - **GGML models** — a path to a single `.bin` model file, also set in
@@ -21,6 +24,20 @@ locations:
 Both binaries must come from the same FFmpeg build and must be version 6 or
 newer (the filtergraph compiler uses `adelay`, `sidechaincompress`, `lut3d`,
 `-progress pipe:1` and libass caption burn-in).
+
+### Binaries bundled with official releases
+
+Official StudioCut releases bundle prebuilt static FFmpeg binaries as Tauri
+sidecars, so no separate FFmpeg installation is required. Windows and Linux
+use the LGPL builds from FFmpeg-Builds (BtbN,
+<https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases>); macOS uses the
+static builds from osxexperts.net (<https://osxexperts.net/>), with a
+separate archive for Apple Silicon and for Intel. The corresponding FFmpeg
+sources can be obtained from those upstream release pages. The sidecars are
+downloaded at build time by `.github/workflows/release.yml` and are not
+stored in this repository. If no bundled sidecar is present, StudioCut falls
+back to `FFMPEG_PATH` / `FFPROBE_PATH`, or to an `ffmpeg` / `ffprobe` binary
+found on `PATH`.
 
 ### Windows (x86_64)
 
@@ -106,6 +123,7 @@ model you chose.
 | libass available for caption burn-in | `ffmpeg -filters | grep subtitles` |
 | whisper-cli present | Settings › Transcription › Check availability |
 | Model loads | same check, with the GGML model path set |
+| Face tracking available | Analysis §07 — the capability line reports the BlazeFace model as available (no setup needed; the model is bundled, see below) |
 | Export works end-to-end | open a project, Export a short 1080p MP4, then inspect it with `ffprobe` |
 
 ## 4. Troubleshooting
@@ -118,3 +136,16 @@ model you chose.
   prints there (missing DLL, wrong architecture, corrupt model) is the cause.
 - **Cloud providers grey out / error** — keys are set in **Settings › API keys**;
   they are stored in the OS credential manager and are never written to projects.
+
+## 5. Bundled face-detection model (no setup needed)
+
+Face-tracked auto-reframe uses a BlazeFace full-range model that ships
+inside the app — there is nothing to install or configure. The model
+file lives in the repository at
+`src-tauri/assets/face-detection/blaze_face_full_range.onnx` with its
+Apache-2.0 license and a README recording the official source URL,
+SHA-256 values, input/output specification, training-data provenance
+(consented images, not WIDER FACE), and the in-house conversion from
+the official `.tflite`. If Analysis §07 reports face tracking as
+unavailable, the bundled model failed to load; the capability message
+states the reason.

@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { native, useProject } from './store';
 import { getCachedTranscriptionModels, getStyleDna, getTranscriptionModel, getWhisperBinary, getWhisperModel, setCachedTranscriptionModels, setTranscriptionModel, setWhisperBinary, setWhisperModel, type ListedModel } from './preferences';
 import type { CaptionPreset } from './timeline';
-import type { Cut, RoughCut, Scene, SceneCut, Transcript } from './analysis';
+import type { Cut, ReframePlan, RoughCut, Scene, SceneCut, Transcript } from './analysis';
 
 type Preview = { thumbnail: number[] | null; peaks: number[] | null };
 
@@ -11,11 +11,10 @@ const defaultModelFor = (provider: string) => provider === 'groq' ? 'whisper-lar
 
 type Result = { projectId: string; revision: number; clipId: string; cuts?: Cut[]; transcript?: Transcript };
 type CutResult = { projectId: string; revision: number; cuts: Cut[] };
-type DiarizationResult = { method: string; turns: { speaker: string; start: number; end: number; wordCount: number }[]; note: string };
-type BeatResult = { method: string; bpm: number | null; confidence: number; beats: number[]; note: string };
-type ReframePlan = { method: string; target: string; sourceWidth: number; sourceHeight: number; crop: { x: number; y: number; width: number; height: number }; ffmpegFilter: string; note: string };
+type DiarizationResult = { method: string; confidence: number; turns: { speaker: string | null; start: number; end: number; wordCount: number; confidence: number }[]; note: string };
+type BeatResult = { method: string; bpm: number | null; confidence: number; tempoStability: number; beats: number[]; note: string };
 export function AnalysisPanel() {
-  const { project, selected, busy, applyAnalysis, seek } = useProject();
+  const { project, selected, busy, applyAnalysis, seek, frame } = useProject();
   const [threshold, setThreshold] = useState(-38);
   const [minimum, setMinimum] = useState(400);
   const [padding, setPadding] = useState(80);
@@ -178,7 +177,7 @@ export function AnalysisPanel() {
     } catch (error) { setFailure(String(error)); setStatus(''); }
     finally { useProject.setState({ busy: false }); }
   }
-  async function runGap(kind: 'speakers' | 'beats' | 'reframe') {
+  async function runGap(kind: 'speakers' | 'beats' | 'reframe' | 'motion-reframe' | 'face-reframe') {
     if (!native || !project || busy) return;
     setFailure('');
     useProject.setState({ busy: true, playing: false });
@@ -188,11 +187,31 @@ export function AnalysisPanel() {
         if (!current || !result!.transcript) throw new Error('Transcribe the clip first, then detect speaker turns.');
         const found = await invoke<DiarizationResult>('detect_speakers', { ...snapshot, words: result!.transcript.items, minPauseSecs: 0.8 });
         setSpeakers(found);
-        setStatus(`${found.turns.length} speaker turn${found.turns.length === 1 ? '' : 's'} detected (${found.method} — pause-based hints, not model output).`);
+        setStatus(`${found.turns.length} speaker turn${found.turns.length === 1 ? '' : 's'} detected (${found.method} — pause-based hints with loudness-weighted confidence, not model output). Labels appear only above 50% confidence.`);
       } else if (kind === 'beats') {
         const found = await invoke<BeatResult>('detect_beats', { ...snapshot });
         setBeats(found);
-        setStatus(found.bpm === null ? 'No stable pulse found — no tempo invented.' : `${found.bpm.toFixed(1)} BPM · ${found.beats.length} beats · confidence ${(found.confidence * 100).toFixed(0)}% (${found.method}).`);
+        setStatus(found.bpm === null ? 'No stable pulse found — no tempo invented.' : `${found.bpm.toFixed(1)} BPM · ${found.beats.length} beats · confidence ${(found.confidence * 100).toFixed(0)}% · tempo stability ${(found.tempoStability * 100).toFixed(0)}% (${found.method}).`);
+      } else if (kind === 'motion-reframe') {
+        if (!clip || asset?.videoStream == null) throw new Error('Select a video clip first.');
+        const atSeconds = Math.max(0, Math.min((frame - clip.start) / fps, clip.duration / fps));
+        const plan = await invoke<ReframePlan>('reframe_motion_clip', { ...snapshot, target: reframeTarget, atSeconds });
+        setReframe(plan);
+        setStatus(plan.method === 'motion-weighted' ? `Motion-weighted reframe for ${plan.target}: crop follows the highest-motion region at the playhead (confidence ${plan.motionConfidence === null ? '—' : `${(plan.motionConfidence * 100).toFixed(0)}%`}) — no face detected.` : `Motion-weighted reframe fell back to a centre crop for ${plan.target}: the frames at the playhead were effectively static. No face detected.`);
+      } else if (kind === 'face-reframe') {
+        if (!clip || asset?.videoStream == null) throw new Error('Select a video clip first.');
+        const plan = await invoke<ReframePlan>('reframe_face_track', { ...snapshot, target: reframeTarget });
+        setReframe(plan);
+        if (plan.method === 'face-tracked') {
+          // Keep the plan for the preview and for cover export, keyed
+          // by clip id. A later fallback plan for the same clip clears
+          // it, so a stale track is never exported.
+          useProject.setState(s => ({ faceTracks: { ...s.faceTracks, [selected!]: plan } }));
+          setStatus(`Face-tracked reframe for ${plan.target}: crop follows the detected face across ${plan.keyframes.length} keyframes (face confidence ${plan.faceConfidence === null ? '—' : `${(plan.faceConfidence * 100).toFixed(0)}%`}). The preview follows the track; cover export applies the time-varying crop.`);
+        } else {
+          useProject.setState(s => { const next = { ...s.faceTracks }; delete next[selected!]; return { faceTracks: next }; });
+          setStatus(`No face tracked consistently — fell back to ${plan.method} for ${plan.target}.`);
+        }
       } else {
         const plan = await invoke<ReframePlan>('reframe_clip', { ...snapshot, target: reframeTarget, focusX: null, focusY: null });
         setReframe(plan);
@@ -201,6 +220,9 @@ export function AnalysisPanel() {
     } catch (error) { setFailure(String(error)); setStatus(''); }
     finally { useProject.setState({ busy: false }); }
   }
+  // Speaker turn covering a transcript time, for labels in the
+  // transcript view. Returns null when no turn covers the time.
+  const speakerForTime = (time: number) => speakers?.turns.find(t => time >= t.start && time < t.end) ?? null;
   return <section className="analysis-panel" aria-label="Silence and captions">
     <div className="analysis-title"><h2>Silence & captions</h2><span>{asset ? `Selected: ${asset.name}` : 'Select an audio or video clip on the timeline'}</span></div>
     {!native && <p className="analysis-notice">Analysis unavailable in browser preview. Use the desktop app for Rust DSP, whisper-cli, and secure BYOK transcription. Saved caption clips still play here.</p>}
@@ -220,7 +242,12 @@ export function AnalysisPanel() {
       <fieldset disabled={busy}><legend>03 · Kinetic captions</legend>
         <label>Caption preset<select value={preset} onChange={e => setPreset(e.target.value as CaptionPreset)}><option value="hormozi">Hormozi · bold punch</option><option value="minimal">Minimal · clean type</option><option value="documentary">Documentary · lower third</option><option value="neon">Neon · electric glow</option></select></label>
         <p>Captions follow the preview’s audio-master clock. Trim, move, split, mute, and undo them like other clips.</p>
-        {current && result.transcript && <><div className="transcript-review">{result.transcript.items.map((item, i) => <button key={i} onClick={() => seek(clip!.start + Math.round(item.start * project!.settings.fps))} title={`${item.start.toFixed(2)}–${item.end.toFixed(2)}s`}>{item.text}</button>)}</div><button onClick={() => void applyAnalysis({ type: 'captions', clipId: result.clipId, transcript: result.transcript!, preset }, result.projectId, result.revision)}>Add {preset} caption clips</button></>}
+        {current && result.transcript && <><div className="transcript-review">{result.transcript.items.map((item, i) => {
+          const turn = speakerForTime(item.start);
+          const prevTurn = i > 0 ? speakerForTime(result.transcript!.items[i - 1].start) : null;
+          const showLabel = turn?.speaker != null && turn !== prevTurn;
+          return <Fragment key={i}>{showLabel && <span style={{ flexBasis: '100%', fontWeight: 700, fontSize: 12 }}>{turn!.speaker} · {Math.round(turn!.confidence * 100)}% confidence</span>}<button onClick={() => seek(clip!.start + Math.round(item.start * project!.settings.fps))} title={`${item.start.toFixed(2)}–${item.end.toFixed(2)}s`}>{item.text}</button></Fragment>;
+        })}</div>{speakers && <p>Speaker labels appear only for turns at or above 50% confidence; turns below that are shown without a label. Labels are pause- and loudness-based hints, not identified speakers.</p>}<button onClick={() => void applyAnalysis({ type: 'captions', clipId: result.clipId, transcript: result.transcript!, preset }, result.projectId, result.revision)}>Add {preset} caption clips</button></>}
       </fieldset>
     </div>
     <fieldset disabled={busy}><legend>04 · Scenes (heuristic)</legend>
@@ -244,15 +271,17 @@ export function AnalysisPanel() {
       {roughResult && <div className="cut-review"><h3>Review rough cut</h3>{roughResult.hook && <p>Hook protected: {(roughResult.hook.start / fps).toFixed(2)}–{(roughResult.hook.end / fps).toFixed(2)}s — this range is never cut.</p>}{roughResult.cuts.length === 0 && <p>Nothing left to cut after protecting the hook.</p>}{roughResult.cuts.map((cut, i) => <div className="cut-range" key={i}><label><input type="checkbox" checked={roughEnabled.includes(i)} onChange={e => setRoughEnabled(e.target.checked ? [...roughEnabled, i] : roughEnabled.filter(n => n !== i))} />{(cut.start / fps).toFixed(2)}–{(cut.end / fps).toFixed(2)}s</label><button onClick={() => seek(Math.max(0, cut.start - fps))}>Preview cut {i + 1}</button></div>)}<button disabled={!roughEnabled.length} onClick={() => void applyAnalysis({ type: 'cuts', cuts: roughResult.cuts.filter((_, i) => roughEnabled.includes(i)) }, roughResult.projectId, roughResult.revision)}>Apply {roughEnabled.length} cuts · one undo</button></div>}
     </fieldset>
     <fieldset disabled={busy}><legend>07 · Speakers, beats &amp; reframe</legend>
-      <p>Speaker turns are pause-based hints and beats are energy-based onset detection — both heuristics, not machine learning. Reframing is a centre crop: no face is detected or tracked.</p>
+      <p>Speaker turns are pause-based hints weighted by clip loudness, each with a confidence score — labels appear only at or above 50% confidence, and turns below that are reported as unknown. Beats are energy-based onset detection — both heuristics, not machine learning. Reframing is a centre crop, a motion-weighted crop that follows the highest-motion region, or a face-tracked crop that follows the detected face across the clip (BlazeFace model, on-device).</p>
       {gapNote && <p>{gapNote}</p>}
       <button disabled={!current || !result?.transcript} onClick={() => void runGap('speakers')}>Detect speaker turns</button>
       <button disabled={!eligible} onClick={() => void runGap('beats')}>Detect beats</button>
       <label>Reframe target<select value={reframeTarget} onChange={e => setReframeTarget(e.target.value)}><option value="9:16">9:16 · vertical</option><option value="1:1">1:1 · square</option></select></label>
       <button disabled={!native || !clip || asset?.videoStream == null || busy} onClick={() => void runGap('reframe')}>Plan reframe</button>
-      {speakers && <div className="cut-review"><h3>{speakers.turns.length} speaker turn{speakers.turns.length === 1 ? '' : 's'} · {speakers.method}</h3>{speakers.turns.length === 0 && <p>No turns found — transcribe a longer passage first.</p>}{speakers.turns.map((t, i) => <div className="cut-range" key={i}><span>{t.speaker} · {t.start.toFixed(2)}–{t.end.toFixed(2)}s · {t.wordCount} words</span><button onClick={() => seek(clip!.start + Math.round(t.start * fps))}>Seek</button></div>)}<p>{speakers.note}</p></div>}
-      {beats && <div className="cut-review"><h3>{beats.bpm === null ? 'No stable tempo' : `${beats.bpm.toFixed(1)} BPM`} · {beats.method}</h3><p>Confidence {(beats.confidence * 100).toFixed(0)}% · {beats.beats.length} beats.</p><p>{beats.note}</p></div>}
-      {reframe && <div className="cut-review"><h3>Reframe {reframe.target} · {reframe.method}</h3><p>Source {reframe.sourceWidth}×{reframe.sourceHeight} → crop {reframe.crop.width}×{reframe.crop.height} at {reframe.crop.x},{reframe.crop.y}.</p><p>FFmpeg filter: <code>{reframe.ffmpegFilter}</code></p><p>{reframe.note}</p></div>}
+      <button disabled={!native || !clip || asset?.videoStream == null || busy} onClick={() => void runGap('motion-reframe')}>Plan motion-weighted reframe</button>
+      <button disabled={!native || !clip || asset?.videoStream == null || busy} onClick={() => void runGap('face-reframe')}>Plan face-tracked reframe</button>
+      {speakers && <div className="cut-review"><h3>{speakers.turns.length} speaker turn{speakers.turns.length === 1 ? '' : 's'} · {speakers.method} · overall confidence {(speakers.confidence * 100).toFixed(0)}%</h3>{speakers.turns.length === 0 && <p>No turns found — transcribe a longer passage first.</p>}{speakers.turns.map((t, i) => <div className="cut-range" key={i}><span>{t.speaker ?? 'Unknown speaker'} · {t.start.toFixed(2)}–{t.end.toFixed(2)}s · {t.wordCount} words · {(t.confidence * 100).toFixed(0)}% confidence</span><button onClick={() => seek(clip!.start + Math.round(t.start * fps))}>Seek</button></div>)}<p>{speakers.note}</p></div>}
+      {beats && <div className="cut-review"><h3>{beats.bpm === null ? 'No stable tempo' : `${beats.bpm.toFixed(1)} BPM`} · {beats.method}</h3><p>Confidence {(beats.confidence * 100).toFixed(0)}% · tempo stability {(beats.tempoStability * 100).toFixed(0)}% · {beats.beats.length} beats.</p><p>{beats.note}</p></div>}
+      {reframe && <div className="cut-review"><h3>Reframe {reframe.target} · {reframe.method}</h3><p>Source {reframe.sourceWidth}×{reframe.sourceHeight} → crop {reframe.crop.width}×{reframe.crop.height} at {reframe.crop.x},{reframe.crop.y}.</p>{reframe.motionConfidence !== null && <p>Motion confidence {(reframe.motionConfidence * 100).toFixed(0)}% — the crop follows the highest-motion region at the playhead.</p>}{reframe.method === 'face-tracked' && <>{reframe.faceConfidence !== null && <p>Face confidence {(reframe.faceConfidence * 100).toFixed(0)}% — the crop follows the detected face.</p>}{reframe.keyframes.length > 0 && <p>Track: {reframe.keyframes.map(k => `${k.tSeconds.toFixed(2)}s → (${(k.focusX * 100).toFixed(0)}%, ${(k.focusY * 100).toFixed(0)}%)`).join(' · ')}</p>}</>}<p>FFmpeg filter: <code>{reframe.ffmpegFilter}</code></p><p>{reframe.note}</p></div>}
     </fieldset>
     <p role="status">{status}</p>{failure && <p role="alert" className="error">{failure}</p>}
   </section>;

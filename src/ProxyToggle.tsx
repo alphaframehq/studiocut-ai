@@ -2,11 +2,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useProject } from './store';
 import { audible } from './timeline';
+import { getEncoderPreference } from './preferences';
 
 type ProxyStatus = {
   state: 'missing' | 'ready' | 'generating' | 'failed';
   proxyPath: string | null; width: number | null; height: number | null;
-  sizeBytes: number | null; error: string | null;
+  sizeBytes: number | null; encoder: string | null; error: string | null;
 };
 
 /** Event dispatched when the proxy/original preference changes for an
@@ -58,7 +59,7 @@ export function ProxyToggle() {
     setBusy(true);
     setError('');
     try {
-      setStatus(await invoke<ProxyStatus>('generate_proxy', { id: assetId }));
+      setStatus(await invoke<ProxyStatus>('generate_proxy', { id: assetId, preference: getEncoderPreference() }));
     } catch (e) { setError(String(e)); } finally { setBusy(false); }
   };
   const remove = async () => {
@@ -83,13 +84,13 @@ export function ProxyToggle() {
   return <section className="proxy-toggle" aria-label="Proxy workflow">
     <header><strong>Proxy</strong><span>540p PREVIEW PROXY</span></header>
     <p className="finish-note">
-      Proxies are low-resolution copies for smoother preview. Originals are never modified. Export always uses the original media.
+      Proxies are low-resolution copies for smoother preview. Originals are never modified. Export uses the original media unless the proxy option is enabled in the export settings.
     </p>
     {!asset
       ? <p className="finish-note">Place the playhead over a video clip to manage its proxy.</p>
       : <>
         <p className="finish-note">{asset.name} — {status?.state === 'ready'
-          ? `proxy ready · ${status.width} × ${status.height}${status.sizeBytes ? ` · ${formatBytes(status.sizeBytes)}` : ''}`
+          ? `proxy ready · ${status.width} × ${status.height}${status.sizeBytes ? ` · ${formatBytes(status.sizeBytes)}` : ''}${status.encoder ? ` · encoder ${status.encoder}` : ''}`
           : status?.state === 'generating' ? 'proxy generating…'
           : status?.state === 'failed' ? `proxy generation failed${status.error ? `: ${status.error}` : ''}`
           : 'no proxy yet'}</p>

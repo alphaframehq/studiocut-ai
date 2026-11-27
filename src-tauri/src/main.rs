@@ -140,6 +140,7 @@ async fn director_propose(
     previous_proposal_id: Option<String>,
     previous_edl: Option<studiocut_ai::edl::Edl>,
     learned_preferences: Option<String>,
+    vision: studiocut_ai::director::VisionRequest,
 ) -> Result<studiocut_ai::director::Proposal, String> {
     use tauri::Manager;
     license_gate(&app)?;
@@ -168,6 +169,7 @@ async fn director_propose(
             mode.as_str(),
             previous,
             learned_preferences,
+            vision,
         )
     })
     .await
@@ -204,6 +206,23 @@ async fn extract_thumbnail(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Vision preview: whether the Director would send footage frames
+/// for a vision request, and which frames, without extracting
+/// anything or calling a provider.
+#[tauri::command]
+async fn director_vision_preview(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    config: studiocut_ai::director::Config,
+    vision: studiocut_ai::director::VisionRequest,
+) -> Result<studiocut_ai::director::VisionPreview, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    Ok(studiocut_ai::director::vision_preview(
+        &project, &config, &vision,
+    ))
 }
 
 #[tauri::command]
@@ -289,9 +308,10 @@ async fn detect_filler_cuts(
     .map_err(|e| e.to_string())?
 }
 
-/// Colour scopes for one clip frame (approximate — computed from a
-/// sample frame no wider than 320 px; a grading aid, not a broadcast
-/// measurement).
+/// Colour scopes for one clip frame (approximate by default —
+/// computed from a sample frame no wider than 320 px; a grading aid,
+/// not a broadcast measurement. Full-resolution sampling analyses
+/// the native frame instead).
 #[tauri::command]
 async fn analyze_scopes(
     state: State<'_, Workspace>,
@@ -299,10 +319,11 @@ async fn analyze_scopes(
     revision: u64,
     clip_id: uuid::Uuid,
     at_seconds: f64,
+    full_resolution: bool,
 ) -> Result<studiocut_ai::scopes::ScopeData, String> {
     let project = analysis_snapshot(&state, project_id, revision)?;
     tauri::async_runtime::spawn_blocking(move || {
-        studiocut_ai::scopes::analyze_scopes(&project, clip_id, at_seconds)
+        studiocut_ai::scopes::analyze_scopes(&project, clip_id, at_seconds, full_resolution)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -343,6 +364,7 @@ async fn generate_proxy(
     app: tauri::AppHandle,
     state: State<'_, Workspace>,
     id: uuid::Uuid,
+    preference: String,
 ) -> Result<studiocut_ai::proxy::ProxyStatus, String> {
     use tauri::Manager;
     let asset = state
@@ -358,9 +380,11 @@ async fn generate_proxy(
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
         .join("media");
-    tauri::async_runtime::spawn_blocking(move || studiocut_ai::proxy::generate_proxy(&root, &asset))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::proxy::generate_proxy(&root, &asset, &preference)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Delete an asset's proxy and its state record. The original media is
@@ -452,8 +476,9 @@ async fn detect_beats(
     .map_err(|e| e.to_string())?
 }
 
-/// Centre-crop reframe plan for a portrait/square target. Face
-/// tracking is unavailable (see ai_gaps::reframe_clip).
+/// Centre-crop reframe plan for a portrait/square target. No face
+/// is detected by this plan itself; face tracking is available
+/// separately (see ai_gaps::reframe_face_track_clip).
 #[tauri::command]
 async fn reframe_clip(
     state: State<'_, Workspace>,
@@ -467,6 +492,49 @@ async fn reframe_clip(
     let project = analysis_snapshot(&state, project_id, revision)?;
     tauri::async_runtime::spawn_blocking(move || {
         studiocut_ai::ai_gaps::reframe_clip(&project, clip_id, &target, focus_x, focus_y)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Motion-weighted reframe plan for a portrait/square target: the
+/// crop centres on the highest-motion region, falling back to the
+/// centre crop for static frames. No face is detected or tracked by
+/// this plan; face tracking is available separately (see
+/// ai_gaps::reframe_face_track_clip).
+#[tauri::command]
+async fn reframe_motion_clip(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    target: String,
+    at_seconds: f64,
+) -> Result<studiocut_ai::ai_gaps::ReframePlan, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::ai_gaps::reframe_motion_clip(&project, clip_id, &target, at_seconds)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Face-tracked reframe plan for a portrait/square target: the crop
+/// centre follows the one face detected consistently across the clip
+/// (see ai_gaps::reframe_face_track_clip). When no face is found
+/// consistently, the plan falls back to the motion-weighted reframe
+/// and says so.
+#[tauri::command]
+async fn reframe_face_track(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    target: String,
+) -> Result<studiocut_ai::ai_gaps::ReframePlan, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::ai_gaps::reframe_face_track_clip(&project, clip_id, &target)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1028,19 +1096,14 @@ fn tool_runs(command: &str) -> bool {
 }
 
 /// First-run check: are the external tools the editor needs actually
-/// installed? Mirrors the lib's resolution (FFMPEG_PATH/FFPROBE_PATH win,
-/// otherwise the bare name on PATH). No keys, no network, no downloads.
+/// installed? Uses the lib's resolution (bundled sidecar first, then
+/// FFMPEG_PATH/FFPROBE_PATH, otherwise the bare name on PATH). No keys,
+/// no network, no downloads.
 #[tauri::command]
 async fn setup_status(binary: String, model: String) -> Result<SetupStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let ffmpeg = std::env::var("FFMPEG_PATH")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| tool_runs("ffmpeg"), |p| tool_runs(&p));
-        let ffprobe = std::env::var("FFPROBE_PATH")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| tool_runs("ffprobe"), |p| tool_runs(&p));
+        let ffmpeg = tool_runs(&studiocut_ai::media::ffmpeg_path());
+        let ffprobe = tool_runs(&studiocut_ai::media::ffprobe_path());
         let whisper_cli = !binary.trim().is_empty() && tool_runs(binary.trim());
         let whisper_model =
             !model.trim().is_empty() && std::path::Path::new(model.trim()).is_file();
@@ -1183,6 +1246,14 @@ async fn media_preview(
         .map_err(|e| e.to_string())?
 }
 
+/// Hardware-encoder status for preview proxy work: which encoder
+/// proxy generation would use for the saved preference, and whether
+/// it is a hardware encoder. Advisory only — it never fails.
+#[tauri::command]
+fn preview_encoder_status(preference: String) -> studiocut_ai::media::EncoderSelection {
+    studiocut_ai::media::preview_encoder_status(&preference)
+}
+
 #[tauri::command]
 fn export_start(
     app: tauri::AppHandle,
@@ -1194,6 +1265,7 @@ fn export_start(
     settings: studiocut_ai::filtergraph::ExportSettings,
 ) -> Result<studiocut_ai::render::Snapshot, String> {
     license_gate(&app)?;
+    use tauri::Manager;
     let project = state
         .0
         .lock()
@@ -1203,7 +1275,12 @@ fn export_start(
     if project.id != project_id || project.revision != revision {
         return Err("Project changed; reopen export".into());
     }
-    exports.start(project, output.into(), settings)
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("media");
+    exports.start_with_media_root(project, output.into(), settings, Some(root))
 }
 #[tauri::command]
 fn export_status(
@@ -1254,6 +1331,7 @@ fn main() {
             measure_loudness,
             list_director_models,
             extract_thumbnail,
+            director_vision_preview,
             director_apply,
             create_project,
             open_project,
@@ -1292,9 +1370,12 @@ fn main() {
             generate_proxy,
             delete_proxy,
             proxy_playback_source,
+            preview_encoder_status,
             detect_speakers,
             detect_beats,
             reframe_clip,
+            reframe_motion_clip,
+            reframe_face_track,
             diarization_capability,
             reframe_capability,
             studiocut_ai::mcp::mcp_list_presets,
@@ -1306,7 +1387,15 @@ fn main() {
             studiocut_ai::mcp::mcp_higgsfield_submit,
             studiocut_ai::mcp::mcp_higgsfield_status,
             studiocut_ai::mcp::mcp_higgsfield_cancel,
-            studiocut_ai::mcp::mcp_download_result
+            studiocut_ai::mcp::mcp_download_result,
+            studiocut_ai::mcp::mcp_tool_form_fields,
+            studiocut_ai::mcp::mcp_validate_tool_arguments,
+            studiocut_ai::mcp::mcp_oauth_discover_higgsfield,
+            studiocut_ai::mcp::mcp_oauth_register_client,
+            studiocut_ai::mcp::mcp_oauth_pkce_pair,
+            studiocut_ai::mcp::mcp_oauth_authorization_url,
+            studiocut_ai::mcp::mcp_oauth_exchange_code,
+            studiocut_ai::mcp::mcp_oauth_refresh_token
         ])
         .run(tauri::generate_context!())
         .expect("Failed to launch StudioCut AI");

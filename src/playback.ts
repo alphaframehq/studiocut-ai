@@ -3,6 +3,7 @@ import type { Asset, Project } from './project';
 import { audible, timelineEnd } from './timeline';
 import { native } from './store';
 import { gainAt } from './effects';
+import { gainDbToLinear, mixerGainDb } from './AudioMixer';
 
 const attachments = new Map<string, { url: string; file: File }>();
 export function attachMedia(asset: Asset, file: File) {
@@ -79,7 +80,7 @@ export class TimelinePlayer {
     this.timer = window.setInterval(() => { void this.fill(generation); }, 100);
   }
   private async prepare(start: number, end: number) {
-    const pieces: { buffer: AudioBuffer; clip: import('./timeline').Clip; at: number; offset: number; duration: number }[] = [];
+    const pieces: { buffer: AudioBuffer; clip: import('./timeline').Clip; trackId: string; at: number; offset: number; duration: number }[] = [];
     if (end <= start) return pieces;
     const fps = this.project.settings.fps;
     for (const track of this.project.tracks.filter(t => t.kind === 'audio' && audible(t, this.project.tracks))) {
@@ -97,7 +98,7 @@ export class TimelinePlayer {
             if (this.browserBuffers.size > 2) this.browserBuffers.delete(this.browserBuffers.keys().next().value!);
           }
         }
-        pieces.push({ buffer, clip, at, offset: !native && this.reader === readAudio ? source : 0, duration: until - at });
+        pieces.push({ buffer, clip, trackId: track.id, at, offset: !native && this.reader === readAudio ? source : 0, duration: until - at });
       }
     }
     return pieces;
@@ -112,9 +113,15 @@ export class TimelinePlayer {
       const duration = Math.min(piece.duration, piece.buffer.duration - piece.offset);
       const sourceFrame = piece.clip.sourceIn + piece.at * this.project.settings.fps - piece.clip.start;
       const keys = piece.clip.effects?.duck ?? [];
-      gain.gain.setValueAtTime(gainAt(keys, sourceFrame), start);
-      for (const key of keys) if (key.frame > sourceFrame && key.frame < sourceFrame + duration * this.project.settings.fps) gain.gain.linearRampToValueAtTime(key.gain, start + (key.frame - sourceFrame) / this.project.settings.fps);
-      gain.gain.linearRampToValueAtTime(gainAt(keys, sourceFrame + duration * this.project.settings.fps), start + duration);
+      // Mixer gain for this clip's track, as a linear multiplier on top
+      // of the clip duck curve, so preview playback follows the mixer.
+      // Mute and solo are already honoured in prepare(), which only
+      // schedules audible tracks; gain changes apply to pieces
+      // scheduled after the change (up to one 2-second window later).
+      const mixerLinear = gainDbToLinear(mixerGainDb(this.project.id, piece.trackId));
+      gain.gain.setValueAtTime(gainAt(keys, sourceFrame) * mixerLinear, start);
+      for (const key of keys) if (key.frame > sourceFrame && key.frame < sourceFrame + duration * this.project.settings.fps) gain.gain.linearRampToValueAtTime(key.gain * mixerLinear, start + (key.frame - sourceFrame) / this.project.settings.fps);
+      gain.gain.linearRampToValueAtTime(gainAt(keys, sourceFrame + duration * this.project.settings.fps) * mixerLinear, start + duration);
       node.onended = () => { node.disconnect(); gain.disconnect(); this.nodes.delete(node); };
       this.nodes.add(node);
       node.start(start, piece.offset, duration);

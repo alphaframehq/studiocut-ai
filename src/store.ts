@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { validateProject, type Project, type Marker } from './project';
+import { type ReframePlan } from './analysis';
 import { editTimeline, emptyHistory, remember, travel, newId, type Edit, type History } from './timeline';
 import { addRecentProject } from './preferences';
 
@@ -10,6 +11,11 @@ type State = {
   project: Project | null; saved: boolean; busy: boolean; message: string; error: string;
   projectPath: string | null; autosaving: boolean; recovery: RecoveryInfo | null;
   history: History; frame: number; playing: boolean; selected: string | null;
+  // Face-tracked reframe plans, keyed by clip id, kept by Analysis
+  // §07 for the preview and for cover export. Entries are only ever
+  // read for clips in the current project, so plans from another
+  // project (clip ids are unique) are never applied.
+  faceTracks: Record<string, ReframePlan>;
   seek: (frame: number) => void;
   replaceTracks: (tracks: import('./timeline').Track[], projectId: string, revision: number) => Promise<void>;
   edit: (edit: Edit) => Promise<void>;
@@ -32,7 +38,7 @@ type State = {
   importMedia: (paths?: string[]) => Promise<void>;
 };
 export const useProject = create<State>((set, get) => ({
-  project: null, saved: false, busy: false, message: '', error: '', projectPath: null, autosaving: false, recovery: null, history: emptyHistory(), frame: 0, playing: false, selected: null,
+  project: null, saved: false, busy: false, message: '', error: '', projectPath: null, autosaving: false, recovery: null, history: emptyHistory(), frame: 0, playing: false, selected: null, faceTracks: {},
   seek: frame => set({ frame: Math.max(0, Math.round(frame)), playing: false }),
   replaceTracks: async (tracks, projectId, revision) => {
     const { project, history, busy } = get();

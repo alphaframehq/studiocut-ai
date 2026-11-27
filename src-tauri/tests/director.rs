@@ -1,9 +1,10 @@
 use serde_json::{json, Value};
 use std::{fs, process::Command};
 use studiocut_ai::{
+    analysis::Scene,
     create_project,
     credentials::{Credentials, Provider},
-    director::{self, Config, Director},
+    director::{self, Config, Director, VisionRequest},
     edl::{self, Edl},
     load_project, media, save_project,
     timeline::{Clip, History, Track},
@@ -249,6 +250,7 @@ fn provider_contracts_context_limits_and_missing_credentials() {
             "edit",
             None,
             None,
+            VisionRequest::default(),
         )
         .err()
         .unwrap()
@@ -263,6 +265,7 @@ fn provider_contracts_context_limits_and_missing_credentials() {
             "edit",
             None,
             None,
+            VisionRequest::default(),
         )
         .err()
         .unwrap()
@@ -282,4 +285,124 @@ fn provider_contracts_context_limits_and_missing_credentials() {
     assert!(local.url().is_ok());
     local.endpoint = "http://remote.example/api/chat".into();
     assert!(local.url().is_err());
+}
+
+#[test]
+fn vision_frames_are_planned_from_scenes_or_evenly_spaced() {
+    let (_temp, p) = fixture();
+    let clip_id = p.tracks[0].clips[0].id;
+    // The fixture clip is 120 frames at 30 fps: 4 seconds of video.
+    let scenes = vec![
+        Scene {
+            start: 0.0,
+            end: 2.0,
+            score: None,
+        },
+        Scene {
+            start: 2.0,
+            end: 4.0,
+            score: None,
+        },
+    ];
+    let from_scenes = director::plan_vision_frames(
+        &p,
+        &VisionRequest {
+            enabled: true,
+            clip_id: Some(clip_id),
+            scenes: scenes.clone(),
+        },
+    );
+    assert_eq!(from_scenes.len(), 2);
+    assert!(from_scenes.iter().all(|f| f.clip_id == clip_id));
+    assert!((from_scenes[0].at_seconds - 0.5).abs() < 1e-9);
+    assert!((from_scenes[1].at_seconds - 2.5).abs() < 1e-9);
+    // No scenes: six frames evenly spaced across the clip.
+    let even = director::plan_vision_frames(
+        &p,
+        &VisionRequest {
+            enabled: true,
+            clip_id: None,
+            scenes: vec![],
+        },
+    );
+    assert_eq!(even.len(), 6);
+    assert!(even.iter().all(|f| f.clip_id == clip_id));
+    assert!((even[0].at_seconds - 1.0 / 3.0).abs() < 1e-9);
+    assert!((even[5].at_seconds - 11.0 / 3.0).abs() < 1e-9);
+    // Scenes for an unknown clip fall back to evenly spaced frames.
+    let unknown = director::plan_vision_frames(
+        &p,
+        &VisionRequest {
+            enabled: true,
+            clip_id: Some(Uuid::new_v4()),
+            scenes,
+        },
+    );
+    assert_eq!(unknown.len(), 6);
+    // Vision off means no frames are planned at all.
+    assert!(director::plan_vision_frames(&p, &VisionRequest::default()).is_empty());
+}
+#[test]
+fn vision_preview_reports_capability_without_calling_a_provider() {
+    let (_temp, p) = fixture();
+    let vision = VisionRequest {
+        enabled: true,
+        clip_id: None,
+        scenes: vec![],
+    };
+    let capable = Config {
+        provider: Provider::Openai,
+        model: "gpt-4o".into(),
+        endpoint: "".into(),
+        max_tokens: 512,
+    };
+    let preview = director::vision_preview(&p, &capable, &vision);
+    assert!(preview.supported);
+    assert_eq!(preview.frames.len(), 6);
+    assert!(preview.note.contains("6 video frames"));
+    let incapable = Config {
+        provider: Provider::Openai,
+        model: "gpt-3.5-turbo".into(),
+        endpoint: "".into(),
+        max_tokens: 512,
+    };
+    let preview = director::vision_preview(&p, &incapable, &vision);
+    assert!(!preview.supported);
+    assert!(preview.frames.is_empty());
+    assert!(preview.note.contains("does not support vision"));
+    let preview = director::vision_preview(&p, &capable, &VisionRequest::default());
+    assert!(preview.supported);
+    assert!(preview.frames.is_empty());
+    assert!(preview.note.contains("Vision frames are off"));
+}
+#[test]
+fn propose_with_vision_and_no_key_fails_before_any_frame_is_sent() {
+    let (_temp, p) = fixture();
+    let config = Config {
+        provider: Provider::Openai,
+        model: "gpt-4o".into(),
+        endpoint: "".into(),
+        max_tokens: 512,
+    };
+    // No credential is configured for OpenAI, so the request must fail
+    // at the key lookup — before any frame is extracted or sent.
+    let error = Director::default()
+        .propose(
+            &Credentials::default(),
+            &p,
+            config,
+            "Edit".into(),
+            true,
+            "edit",
+            None,
+            None,
+            VisionRequest {
+                enabled: true,
+                clip_id: None,
+                scenes: vec![],
+            },
+        )
+        .err()
+        .unwrap();
+    assert!(error.contains("credential"), "{error}");
 }

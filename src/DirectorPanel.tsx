@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { native, useProject } from './store';
+import type { Scene } from './analysis';
 import { compileEdl, parseEdl, summarize, type Edl, type Operation } from './edl';
 import { addDirectorHistory, buildLearnedPreferences, directorOpLabel, getCachedDirectorModels, getDirectorFeedback, getDirectorHistory, getDirectorModel, maybeUpdateStyleDnaFromFeedback, recordDirectorFeedback, recordPaceFeedback, recordPresetFeedback, resetDirectorFeedback, setCachedDirectorModels, setDirectorModel, type DirectorFeedback, type DirectorHistoryEntry, type DirectorListedModel } from './preferences';
 import './director.css';
@@ -19,7 +20,23 @@ type Proposal = {
   diff?: { added: number; removed: number; changed: number };
   gradeSuggestion?: { brightness: number; contrast: number; saturation: number; cube: string | null };
   captionPreset?: string;
+  visionFrames?: number;
+  visionNote?: string | null;
 };
+// A listed model with the optional vision flag the backend reports.
+// Older cached entries have no flag, so callers fall back to
+// modelSupportsVision below. The backend type in preferences.ts is
+// intentionally untouched; this local extension carries the flag.
+type VisionListedModel = DirectorListedModel & { vision?: boolean };
+/** Local mirror of the backend vision-capability rule (OpenAI and
+ * Gemini vision-capable models only). Used when a cached model entry
+ * carries no vision flag yet. Unknown capability means no frames. */
+function modelSupportsVision(provider: Provider, model: string): boolean {
+  const id = model.trim().toLowerCase();
+  if (provider === 'openai') return ['gpt-4o', 'gpt-4.1', 'gpt-4-turbo', 'gpt-5', 'chatgpt-4o'].some(p => id.startsWith(p));
+  if (provider === 'gemini') return id.startsWith('gemini-') && !id.includes('embedding');
+  return false;
+}
 type Continuing = { id: string; edl: Edl; summary: string };
 type LoudnessResult = { integratedLufs: number; gainDb: number; targetLufs: number };
 const providers: [Provider, string][] = [['gemini', 'Gemini'], ['openai', 'OpenAI'], ['claude', 'Claude'], ['groq', 'Groq'], ['openrouter', 'OpenRouter'], ['compatible', 'OpenAI-compatible'], ['ollama', 'Local Ollama'], ['bedrock', 'AWS Bedrock'], ['vertex', 'GCP Vertex AI']];
@@ -83,10 +100,14 @@ export function DirectorPanel() {
   const [context, setContext] = useState<{ data: unknown; bytes: number; omittedAssets: number; omittedClips: number } | null>(null);
   const [raw, setRaw] = useState('');
   const [messages, setMessages] = useState<{ role: string; text: string }[]>([]);
-  const [models, setModels] = useState<DirectorListedModel[]>([]);
+  const [models, setModels] = useState<VisionListedModel[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState('');
   const [modelsNote, setModelsNote] = useState('');
+  const [visionEnabled, setVisionEnabled] = useState(true);
+  const [visionScenes, setVisionScenes] = useState<{ clipId: string; scenes: Scene[] } | null>(null);
+  const [visionScenesLoading, setVisionScenesLoading] = useState(false);
+  const [visionPreview, setVisionPreview] = useState('');
   const [modelMode, setModelMode] = useState<'list' | 'custom'>('list');
   const [customModel, setCustomModel] = useState('');
   const [titles, setTitles] = useState<string | null>(null);
@@ -94,7 +115,7 @@ export function DirectorPanel() {
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
   const [history, setHistory] = useState<DirectorHistoryEntry[]>([]);
   const [hasKey, setHasKey] = useState(false);
-  useEffect(() => { setConsent(false); setContext(null); setProposal(null); setProposalId(null); setContinuing(null); setChecked([]); setPendingModifiedOp(null); setRoughCutApplied(false); setPolishUnlocked(false); setLearnedRecorded({ preset: false, pace: false }); setTitles(null); setLoudness(''); setLoudnessError(''); }, [project?.id]);
+  useEffect(() => { setConsent(false); setContext(null); setProposal(null); setProposalId(null); setContinuing(null); setChecked([]); setPendingModifiedOp(null); setRoughCutApplied(false); setPolishUnlocked(false); setLearnedRecorded({ preset: false, pace: false }); setTitles(null); setLoudness(''); setLoudnessError(''); setVisionScenes(null); setVisionPreview(''); }, [project?.id]);
   useEffect(() => { if (project) setHistory(getDirectorHistory(project.id)); }, [project?.id]);
   useEffect(() => { setConsent(false); setHasKey(false); if (key.current) key.current.value = ''; }, [config.provider, config.endpoint]);
   useEffect(() => { void refreshModels(config.provider, '', config.endpoint, false, config.model); }, []);
@@ -108,27 +129,31 @@ export function DirectorPanel() {
     if (needsKey && !keyValue) { setModels([]); setModelsNote('Enter an API key, then refresh the model list.'); return; }
     if (!bypassCache) {
       const cached = getCachedDirectorModels(p);
-      if (cached) { applyModels(cached.models, currentModel, null); return; }
+      if (cached) { applyModels(cached.models, currentModel, null, p); return; }
     }
     setModelsLoading(true);
     try {
-      const found = await invoke<{ models: DirectorListedModel[]; note: string | null }>('list_director_models', { request: { provider: p, apiKey: keyValue, endpoint: endpointValue } });
+      const found = await invoke<{ models: VisionListedModel[]; note: string | null }>('list_director_models', { request: { provider: p, apiKey: keyValue, endpoint: endpointValue } });
       setCachedDirectorModels(p, found.models);
       if (found.note) setModelsNote(found.note);
-      applyModels(found.models, currentModel, found.note);
+      applyModels(found.models, currentModel, found.note, p);
     } catch (error) { setModelsError(String(error)); }
     finally { setModelsLoading(false); }
   }
   // Keep the currently selected model visible even if the provider no
   // longer lists it (e.g. a custom or retired id).
-  function applyModels(found: DirectorListedModel[], current: string, note: string | null) {
+  function applyModels(found: VisionListedModel[], current: string, note: string | null, provider: Provider) {
     const list = current && !found.some(m => m.id === current) ? [{ id: current, recommended: false, note: null }, ...found] : found;
     setModels(list);
+    const entry = list.find(m => m.id === current);
+    setVisionEnabled(entry?.vision ?? modelSupportsVision(provider, current));
     if (!list.length && !note) setModelsNote('No chat models returned for this provider.');
   }
   function changeProvider(p: Provider) {
     const persisted = getDirectorModel(p) ?? '';
     setConfig({ provider: p, model: persisted, endpoint: p === 'ollama' ? 'http://127.0.0.1:11434/api/chat' : '', maxTokens: 4096 });
+    setVisionEnabled(modelSupportsVision(p, persisted));
+    setVisionScenes(null); setVisionPreview('');
     setModels([]); setModelsError(''); setModelsNote(''); setModelMode('list'); setCustomModel('');
     void refreshModels(p, '', p === 'ollama' ? 'http://127.0.0.1:11434/api/chat' : '', false, persisted);
   }
@@ -136,6 +161,8 @@ export function DirectorPanel() {
     if (id === '__custom') { setModelMode('custom'); return; }
     setModelMode('list');
     setConfig(c => ({ ...c, model: id }));
+    const entry = models.find(m => m.id === id);
+    setVisionEnabled(entry?.vision ?? modelSupportsVision(config.provider, id));
     setDirectorModel(config.provider, id);
   }
   function refreshFeedback() {
@@ -145,6 +172,22 @@ export function DirectorPanel() {
     if (!project) return;
     setHistory(addDirectorHistory(project.id, { kind, instruction: instructionText, summary, at: Date.now(), ...(edl ? { edl } : {}) }));
   }
+  // Vision: the selected model entry reports its capability; cached
+  // entries without the flag fall back to the local capability rule.
+  const selectedModel = models.find(m => m.id === config.model);
+  const visionSupported = !!config.model && (selectedModel?.vision ?? modelSupportsVision(config.provider, config.model));
+  const visionWillSend = visionSupported && visionEnabled;
+  // Show what vision would send before the user consents. The preview
+  // command is optional: when it is unavailable the panel falls back
+  // to the generic description below.
+  useEffect(() => {
+    if (!native || !visionWillSend || !project) { setVisionPreview(''); return; }
+    let cancelled = false;
+    void invoke<{ supported: boolean; frames: { clipId: string; atSeconds: number }[]; note: string }>('director_vision_preview', { projectId: project.id, revision: project.revision, config, vision: { enabled: true, clipId: visionScenes?.clipId ?? null, scenes: visionScenes?.scenes ?? [] } })
+      .then(found => { if (!cancelled) setVisionPreview(found.note); })
+      .catch(() => { if (!cancelled) setVisionPreview(''); });
+    return () => { cancelled = true; };
+  }, [native, visionWillSend, project?.id, project?.revision, config.provider, config.model, visionScenes]);
   if (!project) return null;
   const stale = proposal && (proposal.edl.projectId !== project.id || proposal.edl.baseRevision !== project.revision);
   const cloud = config.provider !== 'ollama';
@@ -238,7 +281,7 @@ export function DirectorPanel() {
     const learned = buildLearnedPreferences();
     setMessages(m => [...m.slice(-15), { role: 'You', text }]);
     setProposal(null); setTitles(null);
-    const result = await invoke<Proposal>('director_propose', { projectId: project.id, revision: project.revision, config, instruction: text, consent, mode: 'edit', previousProposalId: effectiveContinuing?.id ?? null, previousEdl: effectiveContinuing?.edl ?? null, learnedPreferences: learned || null });
+    const result = await invoke<Proposal>('director_propose', { projectId: project.id, revision: project.revision, config, instruction: text, consent, mode: 'edit', previousProposalId: effectiveContinuing?.id ?? null, previousEdl: effectiveContinuing?.edl ?? null, learnedPreferences: learned || null, vision: { enabled: visionWillSend, clipId: visionScenes?.clipId ?? null, scenes: visionScenes?.scenes ?? [] } });
     const current = useProject.getState().project;
     if (!current) throw new Error('Project closed while requesting.');
     compileEdl(current, result.edl);
@@ -252,7 +295,7 @@ export function DirectorPanel() {
     const text = `Suggest 5 video titles and 3 opening hooks for this project. Base them only on the asset names and transcript in the context.${goal ? ` Topic: ${goal}.` : ''}${instruction ? ` Note: ${instruction}` : ''}`;
     setTitles(null);
     const learned = buildLearnedPreferences();
-    const result = await invoke<Proposal>('director_propose', { projectId: project.id, revision: project.revision, config, instruction: text, consent, mode: 'titles', previousProposalId: null, previousEdl: null, learnedPreferences: learned || null });
+    const result = await invoke<Proposal>('director_propose', { projectId: project.id, revision: project.revision, config, instruction: text, consent, mode: 'titles', previousProposalId: null, previousEdl: null, learnedPreferences: learned || null, vision: { enabled: false, clipId: null, scenes: [] } });
     if (!result.text) throw new Error('Provider returned no titles.');
     setTitles(result.text);
     setMessages(m => [...m.slice(-15), { role: 'Director', text: 'Titles & hooks ready — copy what you like, nothing was applied.' }]);
@@ -267,6 +310,21 @@ export function DirectorPanel() {
       setLoudness(`Integrated ${result.integratedLufs.toFixed(1)} LUFS · suggest ${result.gainDb >= 0 ? '+' : ''}${result.gainDb.toFixed(1)} dB to reach ${result.targetLufs} LUFS (suggestion only — audio file unchanged)`);
     } catch (e) {
       setLoudnessError(String(e));
+    }
+  };
+  // Detect scenes on the selected clip so vision frames come from shot
+  // boundaries instead of evenly spaced times. Uses the existing
+  // scene-detection command; without it, frames are evenly spaced.
+  const detectVisionScenes = async () => {
+    if (!project || !selected) return;
+    setVisionScenesLoading(true);
+    try {
+      const scenes = await invoke<Scene[]>('detect_scenes', { projectId: project.id, revision: project.revision, clipId: selected, threshold: 0.4 });
+      setVisionScenes({ clipId: selected, scenes });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setVisionScenesLoading(false);
     }
   };
   function continueFromHistory(entry: DirectorHistoryEntry) {
@@ -315,10 +373,12 @@ export function DirectorPanel() {
       <details open={step === 1}><summary>1. Choose your model & credential storage</summary><fieldset disabled={working}>
         <label>Provider<select value={config.provider} onChange={e => changeProvider(e.target.value as Provider)}>{providers.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
         <label>Model<select value={modelMode === 'custom' ? '__custom' : config.model} onChange={e => pickModel(e.target.value)}>{models.map(m => <option key={m.id} value={m.id}>{m.recommended ? `★ ${m.id}` : m.id}</option>)}<option value="__custom">Custom model…</option></select></label>
-        {modelMode === 'custom' && <label>Custom model id<input value={customModel} onChange={e => { setCustomModel(e.target.value); setConfig(c => ({ ...c, model: e.target.value })); setDirectorModel(config.provider, e.target.value); }} maxLength={200} placeholder="Exact model ID from your provider" spellCheck={false} /></label>}
+        {modelMode === 'custom' && <label>Custom model id<input value={customModel} onChange={e => { setCustomModel(e.target.value); setConfig(c => ({ ...c, model: e.target.value })); setVisionEnabled(modelSupportsVision(config.provider, e.target.value)); setDirectorModel(config.provider, e.target.value); }} maxLength={200} placeholder="Exact model ID from your provider" spellCheck={false} /></label>}
         <button className="button secondary" disabled={!native || modelsLoading || (cloud && !hasKey && !['claude', 'bedrock', 'vertex'].includes(config.provider))} onClick={() => void refreshModels(config.provider, key.current?.value ?? '', config.endpoint, true, config.model)}>{modelsLoading ? 'Loading models…' : 'Refresh models'}</button>
         {modelsNote && <p>{modelsNote}</p>}
         {modelsError && <p role="alert" className="error">{modelsError}</p>}
+        {config.model && visionSupported && <><label className="consent"><input type="checkbox" checked={visionEnabled} disabled={!native} onChange={e => setVisionEnabled(e.target.checked)} />Include video frames — let the Director see the footage (up to 6 frames).</label><p>{visionPreview || 'Frames are taken at scene boundaries when available, otherwise evenly spaced across the project. Each frame is at most 500 KB. Frames are sent only to this provider, using your configured key.'}</p>{visionWillSend && <div className="director-actions"><button className="button secondary" disabled={!native || working || visionScenesLoading || !selected} onClick={() => void detectVisionScenes()}>{visionScenesLoading ? 'Detecting scenes…' : 'Detect scenes for vision frames'}</button>{visionScenes && <><span>{visionScenes.scenes.length} scene{visionScenes.scenes.length === 1 ? '' : 's'} on the selected clip.</span><button className="button secondary" onClick={() => setVisionScenes(null)}>Clear scenes</button></>}{!selected && <span>Select a clip on the timeline to use its scene boundaries.</span>}</div>}</>}
+        {config.model && !visionSupported && <p>This model does not support vision, so the proposal uses project metadata only — no video frames are sent.</p>}
         {['compatible', 'ollama', 'bedrock', 'vertex'].includes(config.provider) && <label>Full API endpoint<input value={config.endpoint} onChange={e => setConfig({ ...config, endpoint: e.target.value })} placeholder={config.provider === 'compatible' ? 'https://your-host/v1/chat/completions' : 'Full model request URL'} /></label>}
         {config.provider === 'bedrock' && <p>Uses a Bedrock API key (bearer token), not an AWS access-key/secret pair.</p>}
         {config.provider === 'vertex' && <p>Uses a Google OAuth access token. Tokens expire; replace yours when needed. Use the Google publisher generateContent endpoint.</p>}
@@ -332,7 +392,7 @@ export function DirectorPanel() {
         <p>Up to 100 assets, 200 clips and 8,000 transcript characters. Paths and media bytes are excluded. Existing caption timings are the transcript; this does not transcribe media. Each request uses current project context, not earlier chat messages.</p>
         <button className="button secondary" disabled={!native || working} onClick={() => void task(async () => { setContext(await invoke('director_context', { projectId: project.id, revision: project.revision })); })}>Inspect outbound context</button>
         {context && <details><summary>{context.bytes.toLocaleString()} bytes · {context.omittedAssets} assets / {context.omittedClips} clips omitted</summary><pre>{JSON.stringify(context.data, null, 2)}</pre></details>}
-        {cloud && <label className="consent"><input type="checkbox" checked={consent} disabled={!native} onChange={e => setConsent(e.target.checked)} />I approve sending this brief and bounded catalog/transcript context to {providers.find(p => p[0] === config.provider)?.[1]}.</label>}
+        {cloud && <label className="consent"><input type="checkbox" checked={consent} disabled={!native} onChange={e => setConsent(e.target.checked)} />I approve sending this brief, bounded catalog/transcript context{visionWillSend ? ' and up to 6 video frames from the footage' : ''} to {providers.find(p => p[0] === config.provider)?.[1]}.</label>}
         <button className="button primary" disabled={!native || working || busy || !config.model || (cloud && !consent) || !(instruction.trim() || goal.trim())} onClick={() => void request()}>{working ? 'Waiting for a validated proposal…' : 'Generate edit proposal'}</button>
         <button className="button secondary" disabled={!native || working || busy || !config.model || (cloud && !consent)} onClick={() => void requestTitles()}>{working ? 'Working…' : 'Suggest titles & hooks'}</button>
         <button className="button secondary" disabled={!native || working || !selected} onClick={() => void measureLoudness()}>Measure loudness</button>
@@ -359,6 +419,7 @@ export function DirectorPanel() {
     </div><aside className="director-review" aria-label="Chat and edit approval"><h3>3. Review & approve</h3><p className="director-badge">Propose → validate → approve → one undo</p>
       <div className="director-messages" aria-live="polite">{messages.map((m, i) => <div key={i}><strong>{m.role}</strong><p>{m.text}</p></div>)}</div>
       {proposal ? <><h4>{proposal.edl.summary}</h4><p>{proposal.edl.operations.length} operations · based on revision {proposal.edl.baseRevision}</p>
+        {proposal.visionNote && <p>{proposal.visionNote}</p>}
         {proposal.plan ? <p>{(['pace', 'cuts', 'captions', 'grade', 'music'] as const).map(field => <span key={field} style={{ display: 'inline-block', border: '1px solid var(--color-border-strong)', borderRadius: 4, padding: '2px 6px', marginRight: 6, marginBottom: 4 }}>{field.charAt(0).toUpperCase() + field.slice(1)}: {proposal.plan![field]}</span>)}</p> : <p>Plan not returned by this model.</p>}
         {proposal.qaDropped && proposal.qaDropped.length > 0 && <p>QA dropped {proposal.qaDropped.length} op(s): {proposal.qaDropped.map(q => `#${q.index + 1}: ${q.reason}`).join('; ')} (deterministic Rust validation — these operations were removed before review.)</p>}
         {proposal.diff && <p>vs previous: +{proposal.diff.added} added, −{proposal.diff.removed} removed, ~{proposal.diff.changed} changed</p>}

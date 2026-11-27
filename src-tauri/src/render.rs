@@ -60,8 +60,25 @@ impl ExportManager {
         output: PathBuf,
         settings: ExportSettings,
     ) -> Result<Snapshot, String> {
+        self.start_with_media_root(project, output, settings, None)
+    }
+
+    /// Start an export, resolving proxy sources against `media_root`
+    /// when `settings.use_proxy` is set. Callers that pass `None` get
+    /// the original-only behaviour; a proxy request without a media
+    /// root is rejected rather than silently exporting originals.
+    pub fn start_with_media_root(
+        &self,
+        project: Project,
+        output: PathBuf,
+        settings: ExportSettings,
+        media_root: Option<PathBuf>,
+    ) -> Result<Snapshot, String> {
         project.validate()?;
         settings.validate()?;
+        if settings.use_proxy && media_root.is_none() {
+            return Err("Proxy export needs the media cache location".into());
+        }
         if !output.is_absolute()
             || output.extension().and_then(|s| s.to_str()) != Some(settings.container.as_str())
         {
@@ -101,7 +118,14 @@ impl ExportManager {
         let manager = self.clone();
         let id = snapshot.id;
         thread::spawn(move || {
-            let result = manager.run(id, &project, &output, &settings, &cancel);
+            let result = manager.run(
+                id,
+                &project,
+                &output,
+                &settings,
+                media_root.as_deref(),
+                &cancel,
+            );
             if let Err(error) = result {
                 manager.update(id, |s| {
                     s.state = if cancel.load(Ordering::SeqCst) {
@@ -173,6 +197,7 @@ impl ExportManager {
         project: &Project,
         output: &Path,
         settings: &ExportSettings,
+        media_root: Option<&Path>,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
         let directory = tempfile::Builder::new()
@@ -189,7 +214,7 @@ impl ExportManager {
         }) {
             crate::media::verified_source(asset)?;
         }
-        let compiled = filtergraph::compile(project, settings)?;
+        let compiled = filtergraph::compile_with_media_root(project, settings, media_root)?;
         for (name, text) in &compiled.resources {
             fs::write(root.join(name), text).map_err(|e| e.to_string())?;
         }
@@ -242,13 +267,25 @@ impl ExportManager {
         }
         let encoder = selected
             .ok_or("No working encoder, including libx264. Install a compatible FFmpeg build.")?;
+        let proxy_note = if settings.use_proxy {
+            if compiled.proxy_clips > 0 {
+                format!(
+                    " Export is using 540p proxy files for {} of {} clips; the remaining clips use original media. Proxy footage is lower resolution than the originals.",
+                    compiled.proxy_clips, compiled.total_clips
+                )
+            } else {
+                " Proxy export was requested but no ready proxies were found; all clips use original media.".to_string()
+            }
+        } else {
+            String::new()
+        };
         self.update(id, |s| {
             s.encoder = Some(encoder.clone());
             s.state = "rendering".into();
             s.disclosure = if encoder == "libx264" && settings.encoder != "libx264" {
-                "Hardware encoder unavailable. Export is using libx264 CPU fallback.".into()
+                format!("Hardware encoder unavailable. Export is using libx264 CPU fallback.{proxy_note}")
             } else {
-                format!("Export encoder: {encoder}")
+                format!("Export encoder: {encoder}.{proxy_note}")
             };
         });
         let temporary = root.join(format!("output.{}", settings.container));
