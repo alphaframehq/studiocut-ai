@@ -29,6 +29,29 @@ pub struct ExportSettings {
     /// to the mixer range at use; see `scopes::audio_gain`.
     #[serde(default)]
     pub track_gains: BTreeMap<String, f64>,
+    /// Face tracks for `cover` exports, keyed by clip id: when a clip
+    /// has a face-tracked reframe plan (see
+    /// [`crate::ai_gaps::reframe_face_track_clip`]), the cover crop
+    /// follows the track instead of staying centred. The keyframe
+    /// shape mirrors [`crate::ai_gaps::ReframeKeyframe`]. Defaults to
+    /// empty (centre crop); old payloads omit this field. Tracks are
+    /// ignored for `fit` exports and for clips whose crop already
+    /// fills the frame.
+    #[serde(default)]
+    pub face_tracks: BTreeMap<String, Vec<FaceTrackKeyframe>>,
+}
+
+/// One keyframe of a face track for export: at `t_seconds` into the
+/// clip the crop is centred on (`focus_x`, `focus_y`) in normalised
+/// frame coordinates. The shape mirrors
+/// [`crate::ai_gaps::ReframeKeyframe`] (the plan type); it is defined
+/// here so the export layer does not depend on the analysis layer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FaceTrackKeyframe {
+    pub t_seconds: f64,
+    pub focus_x: f64,
+    pub focus_y: f64,
 }
 fn default_aspect() -> String {
     "landscape".into()
@@ -47,6 +70,7 @@ impl Default for ExportSettings {
             fill: default_fill(),
             use_proxy: false,
             track_gains: BTreeMap::new(),
+            face_tracks: BTreeMap::new(),
         }
     }
 }
@@ -67,6 +91,14 @@ impl ExportSettings {
             || !["landscape", "vertical", "square"].contains(&self.aspect.as_str())
             || !["fit", "cover"].contains(&self.fill.as_str())
             || self.track_gains.values().any(|gain| !gain.is_finite())
+            || self.face_tracks.values().flatten().any(|point| {
+                !point.t_seconds.is_finite()
+                    || point.t_seconds < 0.0
+                    || !point.focus_x.is_finite()
+                    || !(0.0..=1.0).contains(&point.focus_x)
+                    || !point.focus_y.is_finite()
+                    || !(0.0..=1.0).contains(&point.focus_y)
+            })
         {
             return Err("Unsupported export settings".into());
         }
@@ -128,6 +160,71 @@ fn curve(keys: &[(u32, f64)], time: &str, default: f64) -> String {
         keys[0].0,
         number(keys[0].1)
     )
+}
+
+/// Time-varying `cover` crop for a clip with a face track, or `None`
+/// when no usable track exists for that clip. The crop window follows
+/// the face: `x = focus_x * iw - ow / 2`, clamped into the frame (and
+/// likewise for `y`). Keyframe times are clip-relative seconds; they
+/// are converted to source frame numbers (`source_in + t_seconds *
+/// fps`) in the same domain as the `time` expression the zoom
+/// keyframes use, so the curve stays correct at any clip speed.
+/// Returns `None` when the track is empty, its points are out of
+/// range, or the crop already fills the frame (no room to move).
+fn face_cover_crop(
+    tracks: &BTreeMap<String, Vec<FaceTrackKeyframe>>,
+    clip_id: &str,
+    source_in: u32,
+    fps: f64,
+    out_w: u32,
+    out_h: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+    time: &str,
+) -> Option<String> {
+    let points = tracks.get(clip_id)?;
+    if points.is_empty() || (canvas_w <= out_w && canvas_h <= out_h) {
+        return None;
+    }
+    let mut points: Vec<&FaceTrackKeyframe> = points.iter().collect();
+    points.sort_by(|a, b| {
+        a.t_seconds
+            .partial_cmp(&b.t_seconds)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // The curve helper needs strictly increasing keys; when two
+    // keyframes share a time, the later one wins.
+    let mut deduped: Vec<&FaceTrackKeyframe> = Vec::with_capacity(points.len());
+    for point in points {
+        if let Some(last) = deduped.last_mut() {
+            if last.t_seconds == point.t_seconds {
+                *last = point;
+                continue;
+            }
+        }
+        deduped.push(point);
+    }
+    let points = deduped;
+    if points.is_empty() {
+        return None;
+    }
+    let keys = |get: fn(&FaceTrackKeyframe) -> f64| -> Vec<(u32, f64)> {
+        points
+            .iter()
+            .map(|point| {
+                let frame = source_in as f64 + point.t_seconds * fps;
+                (
+                    (frame.round() as u64).min(u32::MAX as u64) as u32,
+                    get(point),
+                )
+            })
+            .collect()
+    };
+    let x = curve(&keys(|point| point.focus_x), time, 0.5);
+    let y = curve(&keys(|point| point.focus_y), time, 0.5);
+    Some(format!(
+        "crop={out_w}:{out_h}:x='min(max(({x})*iw-ow/2,0),iw-ow)':y='min(max(({y})*ih-oh/2,0),ih-oh)'"
+    ))
 }
 fn ass_time(seconds: f64) -> String {
     let cs = (seconds * 100.0).round() as u64;
@@ -337,8 +434,23 @@ pub fn compile_with_media_root(
             let time = format!("(t*{}+{})", number(fps * f.speed), clip.source_in);
             if track.kind == "video" {
                 let stream = asset.video_stream.ok_or("Video stream missing")?;
+                // `cover` fills the canvas and crops the overflow. With
+                // a face track for this clip, the crop window follows
+                // the tracked face over time; otherwise it stays
+                // centred.
                 let fit = if cover {
-                    format!("crop={w}:{h}:(iw-ow)/2:(ih-oh)/2")
+                    face_cover_crop(
+                        &settings.face_tracks,
+                        &clip.id.to_string(),
+                        clip.source_in,
+                        fps,
+                        w,
+                        h,
+                        canvas_w,
+                        canvas_h,
+                        &time,
+                    )
+                    .unwrap_or_else(|| format!("crop={w}:{h}:(iw-ow)/2:(ih-oh)/2"))
                 } else {
                     format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
                 };
@@ -560,6 +672,7 @@ mod tests {
             fill: fill.into(),
             use_proxy: false,
             track_gains: BTreeMap::new(),
+            face_tracks: BTreeMap::new(),
         }
     }
     /// One-clip audio project over a real (placeholder) media file, so
@@ -840,5 +953,111 @@ mod tests {
         let compiled = compile_with_media_root(&project, &config, Some(root.path())).unwrap();
         assert_eq!(compiled.proxy_clips, 0);
         assert_eq!(compiled.total_clips, 1);
+    }
+    #[test]
+    fn face_track_cover_crop_follows_the_track() {
+        let mut tracks = BTreeMap::new();
+        tracks.insert(
+            "clip-1".into(),
+            vec![
+                FaceTrackKeyframe {
+                    t_seconds: 0.0,
+                    focus_x: 0.2,
+                    focus_y: 0.5,
+                },
+                FaceTrackKeyframe {
+                    t_seconds: 1.0,
+                    focus_x: 0.8,
+                    focus_y: 0.5,
+                },
+            ],
+        );
+        let crop = face_cover_crop(
+            &tracks, "clip-1", 0, 30.0, 608, 1080, 1920, 1080, "(t*30+0)",
+        )
+        .unwrap();
+        // Time-varying crop: the window follows the face through the
+        // keyframe curve (frames 0 and 30), clamped into the frame.
+        assert!(crop.starts_with("crop=608:1080:x='min(max("), "{crop}");
+        assert!(crop.contains("if(lt((t*30+0),30)"), "{crop}");
+        assert!(crop.contains("iw-ow"), "{crop}");
+        assert!(crop.contains("ih-oh"), "{crop}");
+    }
+    #[test]
+    fn face_track_cover_crop_ignores_missing_or_full_frame_tracks() {
+        let tracks: BTreeMap<String, Vec<FaceTrackKeyframe>> = BTreeMap::new();
+        assert!(
+            face_cover_crop(&tracks, "clip-1", 0, 30.0, 608, 1080, 1920, 1080, "(t*30+0)")
+                .is_none()
+        );
+        let mut tracks = BTreeMap::new();
+        tracks.insert(
+            "clip-1".into(),
+            vec![FaceTrackKeyframe {
+                t_seconds: 0.0,
+                focus_x: 0.2,
+                focus_y: 0.5,
+            }],
+        );
+        // The crop already fills the frame: no room for the window to move.
+        assert!(
+            face_cover_crop(&tracks, "clip-1", 0, 30.0, 1920, 1080, 1920, 1080, "(t*30+0)")
+                .is_none()
+        );
+    }
+    #[test]
+    fn cover_export_with_face_track_emits_time_varying_crop() {
+        let root = tempfile::tempdir().unwrap();
+        let (project, _) = video_project(root.path());
+        let clip_id = project.tracks[0].clips[0].id.to_string();
+        let mut config = settings("vertical", "cover", 1080);
+        config.face_tracks.insert(
+            clip_id,
+            vec![
+                FaceTrackKeyframe {
+                    t_seconds: 0.0,
+                    focus_x: 0.2,
+                    focus_y: 0.5,
+                },
+                FaceTrackKeyframe {
+                    t_seconds: 1.0,
+                    focus_x: 0.8,
+                    focus_y: 0.5,
+                },
+            ],
+        );
+        let graph = compile(&project, &config).unwrap().graph;
+        assert!(graph.contains("crop=608:1080:x='min(max("), "{graph}");
+        assert!(graph.contains("if(lt("), "{graph}");
+        assert!(
+            !graph.contains("crop=608:1080:(iw-ow)/2:(ih-oh)/2"),
+            "{graph}"
+        );
+        // Without the track, the same export stays centre-cropped.
+        let plain = compile(&project, &settings("vertical", "cover", 1080))
+            .unwrap()
+            .graph;
+        assert!(
+            plain.contains("crop=608:1080:(iw-ow)/2:(ih-oh)/2"),
+            "{plain}"
+        );
+    }
+    #[test]
+    fn face_track_settings_validate_and_old_payloads_still_parse() {
+        let mut config = settings("vertical", "cover", 1080);
+        config.face_tracks.insert(
+            "clip-1".into(),
+            vec![FaceTrackKeyframe {
+                t_seconds: 0.0,
+                focus_x: 1.5,
+                focus_y: 0.5,
+            }],
+        );
+        assert!(config.validate().is_err());
+        let parsed: ExportSettings =
+            serde_json::from_str(r#"{"container":"mp4","height":1080,"fps":30,"encoder":"auto"}"#)
+                .unwrap();
+        assert!(parsed.face_tracks.is_empty());
+        assert!(parsed.validate().is_ok());
     }
 }
