@@ -83,8 +83,9 @@ fn scopes_shape_is_pure_and_counts_every_pixel() {
     for _ in 0..16 {
         pixels.extend_from_slice(&[255u8, 0, 0]);
     }
-    let scopes = shape_scopes(&pixels, 4, 4);
+    let scopes = shape_scopes(&pixels, 4, 4, false);
     assert!(scopes.approximate);
+    assert!(!scopes.full_resolution);
     assert_eq!(scopes.waveform.len(), WAVEFORM_COLUMNS);
     assert_eq!(scopes.histogram_luma.iter().sum::<u32>(), 16);
     assert_eq!(
@@ -105,9 +106,10 @@ fn analyze_scopes_from_a_real_frame_is_approximate() {
     assert_eq!((asset.width, asset.height), (Some(1280), Some(720)));
     let clip_id = Uuid::new_v4();
     let project = project_with_clip(&asset, clip_id);
-    let scopes = analyze_scopes(&project, clip_id, 0.5).unwrap();
+    let scopes = analyze_scopes(&project, clip_id, 0.5, false).unwrap();
     // Approximation is labelled, never hidden.
     assert!(scopes.approximate);
+    assert!(!scopes.full_resolution);
     assert_eq!((scopes.sample_width, scopes.sample_height), (320, 180));
     assert_eq!(scopes.waveform.len(), WAVEFORM_COLUMNS);
     assert_eq!(scopes.histogram_luma.iter().sum::<u32>(), 320 * 180);
@@ -115,7 +117,30 @@ fn analyze_scopes_from_a_real_frame_is_approximate() {
     assert!(scopes.vectorscope_peak > 0);
     assert!(scopes.waveform.iter().all(|[min, max]| min <= max));
     // Out-of-range times and unknown clips are rejected.
-    assert!(analyze_scopes(&project, clip_id, 2.0).is_err());
-    assert!(analyze_scopes(&project, Uuid::new_v4(), 0.5).is_err());
+    assert!(analyze_scopes(&project, clip_id, 2.0, false).is_err());
+    assert!(analyze_scopes(&project, Uuid::new_v4(), 0.5, false).is_err());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_scopes_full_resolution_uses_the_native_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("cache");
+    let path = directory.path().join("scope-clip-full.mp4");
+    fixture(&path);
+    let asset = import_media(&root, &path).unwrap();
+    assert_eq!((asset.width, asset.height), (Some(1280), Some(720)));
+    let clip_id = Uuid::new_v4();
+    let project = project_with_clip(&asset, clip_id);
+    let scopes = analyze_scopes(&project, clip_id, 0.5, true).unwrap();
+    // Full-resolution sampling is labelled as not approximate.
+    assert!(!scopes.approximate);
+    assert!(scopes.full_resolution);
+    assert_eq!((scopes.sample_width, scopes.sample_height), (1280, 720));
+    assert_eq!(scopes.waveform.len(), WAVEFORM_COLUMNS);
+    assert_eq!(scopes.histogram_luma.iter().sum::<u32>(), 1280 * 720);
+    assert_eq!(scopes.vectorscope.iter().sum::<u32>(), 1280 * 720);
+    assert!(scopes.vectorscope_peak > 0);
+    assert!(scopes.waveform.iter().all(|[min, max]| min <= max));
     let _ = fs::remove_file(&path);
 }
