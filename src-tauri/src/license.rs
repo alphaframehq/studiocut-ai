@@ -145,6 +145,7 @@ fn first_line(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn command_output(mut command: std::process::Command) -> Option<String> {
     use std::io::Read;
     use std::process::Stdio;

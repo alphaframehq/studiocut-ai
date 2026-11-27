@@ -37,7 +37,7 @@ pub fn extract_thumbnail(
     }
     let source_path = media::verified_source(asset)?;
     let source_time = clip.source_in as f64 / project.settings.fps as f64 + at_seconds;
-    let mut file = media::run(
+    let file = media::run(
         "ffmpeg",
         &[
             "-nostdin",
