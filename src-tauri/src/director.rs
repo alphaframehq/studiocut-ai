@@ -212,7 +212,7 @@ const VERTEX_NOTE: &str =
     "Vertex model list needs a project-scoped API call — paste the full model path";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum ModelsAuth {
+pub enum ModelsAuth {
     Bearer,
     GoogApiKey,
     None,
