@@ -133,7 +133,11 @@ pub fn waveform_columns(pixels: &[u8], width: u32, height: u32) -> Vec<[u8; 2]> 
         for x in 0..width as usize {
             let offset = (y * width as usize + x) * 3;
             let (luma, _, _) = rgb_to_ycbcr(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-            let column = (x * WAVEFORM_COLUMNS) / width as usize;
+            let column = if width as usize <= 1 {
+                0
+            } else {
+                (x * (WAVEFORM_COLUMNS - 1)) / (width as usize - 1)
+            };
             columns[column][0] = columns[column][0].min(luma);
             columns[column][1] = columns[column][1].max(luma);
             present[column] = true;
@@ -274,9 +278,11 @@ pub mod audio_gain {
         gain_db.clamp(MIN_GAIN_DB, MAX_GAIN_DB)
     }
 
-    /// Convert a gain in dB to a linear multiplier.
+    /// Convert a gain in dB to a linear multiplier. The conversion is
+    /// unclamped; slider-range clamping is the caller's job and lives
+    /// in [`clamp_gain_db`].
     pub fn gain_db_to_linear(gain_db: f64) -> f64 {
-        10f64.powf(clamp_gain_db(gain_db) / 20.0)
+        10f64.powf(gain_db / 20.0)
     }
 
     /// Estimated integrated loudness after applying `gain_db` to a clip
