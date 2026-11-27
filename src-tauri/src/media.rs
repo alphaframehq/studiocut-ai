@@ -659,6 +659,226 @@ pub fn media_preview(root: &Path, asset: &Asset) -> Result<Preview, String> {
     Ok(Preview { thumbnail, peaks })
 }
 
+// --- Hardware-accelerated preview support ---------------------------------
+// The program monitor itself is a plain <video> element (see Preview.tsx):
+// decoding is done by the operating system's WebView media pipeline,
+// which already uses GPU decode where the platform provides it. There is
+// no application decode path to accelerate, and no new dependency is
+// introduced for one. The realistic hardware win for preview work is the
+// FFmpeg encode that produces the 540p proxy: proxy generation runs once
+// per clip, and a hardware encoder (NVENC / Quick Sync / AMF) makes it
+// substantially faster while the preview keeps playing the original. The
+// helpers below resolve which encoder proxy generation should use. They
+// live here, next to the FFmpeg tool resolver, so proxy.rs can reuse
+// them without duplicating the probe logic already used by export
+// (render.rs). Wiring them into generate_proxy is a separate, small
+// change in proxy.rs; see the gap-fix report handoff note.
+
+/// Hardware H.264 encoders, in probe order. The order matches the export
+/// auto order in render.rs, except that VideoToolbox is absent: it only
+/// offers HEVC in the saved preference list, and a proxy must stay H.264
+/// because the WebView preview cannot decode HEVC on every platform.
+pub const PROXY_HARDWARE_ENCODERS: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv"];
+
+/// Software H.264 encoder. Always the last candidate and the fallback.
+pub const PROXY_SOFTWARE_ENCODER: &str = "libx264";
+
+/// Candidate encoders for proxy generation, from the saved encoder
+/// preference (see preferences.ts `ENCODERS`). A HEVC preference
+/// (hevc_videotoolbox) resolves to the H.264 hardware order: proxies must
+/// stay H.264 for WebView playback. Unknown or empty preferences resolve
+/// to the automatic order.
+pub fn proxy_encoder_candidates(preference: &str) -> Vec<&'static str> {
+    match preference {
+        "libx264" => vec![PROXY_SOFTWARE_ENCODER],
+        "h264_nvenc" => vec!["h264_nvenc", PROXY_SOFTWARE_ENCODER],
+        "h264_amf" => vec!["h264_amf", PROXY_SOFTWARE_ENCODER],
+        "h264_qsv" => vec!["h264_qsv", PROXY_SOFTWARE_ENCODER],
+        _ => {
+            let mut candidates = PROXY_HARDWARE_ENCODERS.to_vec();
+            candidates.push(PROXY_SOFTWARE_ENCODER);
+            candidates
+        }
+    }
+}
+
+/// Whether an encoder name is one of the known hardware encoders.
+pub fn is_hardware_encoder(encoder: &str) -> bool {
+    PROXY_HARDWARE_ENCODERS.contains(&encoder)
+}
+
+/// Parse the output of `ffmpeg -hide_banner -encoders` into encoder
+/// names. Only the name column is kept; the header, the flag legend and
+/// the separator line are ignored.
+pub fn parse_ffmpeg_encoders(output: &str) -> Vec<String> {
+    let mut encoders = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let flags = fields[0];
+        let name = fields[1];
+        if flags.len() != 6
+            || !flags.bytes().all(|b| b.is_ascii_alphabetic() || b == b'.')
+            || name == "="
+        {
+            continue;
+        }
+        encoders.push(name.to_string());
+    }
+    encoders
+}
+
+/// Encoder resolved for preview proxy work, as reported to the UI.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncoderSelection {
+    /// Encoder name FFmpeg should be invoked with.
+    pub encoder: String,
+    /// True when the encoder is hardware-accelerated.
+    pub hardware: bool,
+    /// Human-readable note for the preview footer. It states detection
+    /// only: hardware availability is a probed fact, and the CPU
+    /// fallback statement describes the encoder proxy generation falls
+    /// back to when no hardware encoder is available.
+    pub note: String,
+}
+
+/// Select the first available candidate for a preference. Pure logic:
+/// `available` is the list of candidates that actually probed
+/// successfully, in preference order. When nothing is available the
+/// software encoder is still reported, with a note that no working
+/// encoder was found.
+pub fn select_encoder(preference: &str, available: &[String]) -> EncoderSelection {
+    let selected = proxy_encoder_candidates(preference)
+        .into_iter()
+        .find(|candidate| available.iter().any(|name| name == candidate));
+    match selected {
+        Some(encoder) => {
+            let hardware = is_hardware_encoder(encoder);
+            let note = if hardware {
+                format!("Hardware encoder detected: {encoder}.")
+            } else if preference == "libx264" {
+                "CPU encoding (libx264) selected in preferences.".to_string()
+            } else if matches!(preference, "h264_nvenc" | "h264_amf" | "h264_qsv") {
+                format!(
+                    "{preference} is unavailable — proxy generation uses CPU encoding (libx264)."
+                )
+            } else {
+                "No hardware encoder detected — proxy generation uses CPU encoding (libx264)."
+                    .to_string()
+            };
+            EncoderSelection {
+                encoder: encoder.to_string(),
+                hardware,
+                note,
+            }
+        }
+        None => EncoderSelection {
+            encoder: PROXY_SOFTWARE_ENCODER.to_string(),
+            hardware: false,
+            note: "No working encoder detected. Install a compatible FFmpeg build.".to_string(),
+        },
+    }
+}
+
+/// Quality flags for one proxy encode with the given encoder. The
+/// software encoder keeps the settings proxy generation already uses.
+/// Hardware encoders use their own constant-quality controls at the same
+/// target quality; `-preset` / `-crf` are libx264-only and must not be
+/// passed to them.
+pub fn proxy_encoder_quality_args(encoder: &str) -> Vec<&'static str> {
+    match encoder {
+        "h264_nvenc" => vec!["-preset", "fast", "-cq", "23"],
+        "h264_qsv" => vec!["-preset", "veryfast", "-global_quality", "23"],
+        "h264_amf" => vec![
+            "-quality", "speed", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23",
+        ],
+        _ => vec!["-preset", "veryfast", "-crf", "23"],
+    }
+}
+
+/// Probe one encoder with a single black frame, mirroring the export
+/// probe in render.rs. Listing an encoder does not prove it works (an
+/// NVENC build without a GPU still lists h264_nvenc), so proxy
+/// generation must probe before trusting the list.
+fn probe_encoder(encoder: &str) -> bool {
+    run(
+        "ffmpeg",
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1920x1080:r=30",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            encoder,
+            "-threads",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "null",
+            "-",
+        ],
+        Duration::from_secs(15),
+        32_768,
+    )
+    .is_ok()
+}
+
+/// List the encoders the FFmpeg build reports, for the probe pre-filter.
+/// An error (or an empty list) means the caller probes every candidate.
+fn ffmpeg_encoders() -> Result<Vec<String>, String> {
+    let (stdout, _stderr) = run_text(
+        "ffmpeg",
+        &["-hide_banner", "-encoders"],
+        Duration::from_secs(15),
+        1_048_576,
+    )?;
+    Ok(parse_ffmpeg_encoders(&stdout))
+}
+
+/// Resolve the encoder proxy generation should use for a preference:
+/// probe the candidates in order and return the first that works, with
+/// the software encoder as the fallback. Never fails: when nothing
+/// probes successfully the selection still reports libx264 with a note
+/// that no working encoder was found.
+pub fn resolve_preview_encoder(preference: &str) -> EncoderSelection {
+    let candidates = proxy_encoder_candidates(preference);
+    let listed = ffmpeg_encoders().unwrap_or_default();
+    let to_probe: Vec<&'static str> = if listed.is_empty() {
+        candidates
+    } else {
+        candidates
+            .into_iter()
+            .filter(|candidate| listed.iter().any(|name| name == candidate))
+            .collect()
+    };
+    let mut available = Vec::new();
+    for candidate in to_probe {
+        if probe_encoder(candidate) {
+            available.push(candidate.to_string());
+        }
+    }
+    select_encoder(preference, &available)
+}
+
+/// Status of the encoder preview proxy work uses, for the
+/// `preview_encoder_status` command (registered by the coordinator in
+/// main.rs). Takes the saved preference string from preferences.ts
+/// (`getEncoderPreference()`); unknown values resolve to automatic.
+pub fn preview_encoder_status(preference: &str) -> EncoderSelection {
+    resolve_preview_encoder(preference)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +953,134 @@ mod tests {
         assert_eq!(
             resolve_tool_path_for_platform("ffmpeg", None, Some(plain.path()), true),
             "ffmpeg"
+        );
+    }
+
+    #[test]
+    fn proxy_encoder_candidates_prefer_hardware_then_cpu() {
+        let auto = vec!["h264_nvenc", "h264_amf", "h264_qsv", "libx264"];
+        assert_eq!(proxy_encoder_candidates("auto"), auto);
+        assert_eq!(proxy_encoder_candidates(""), auto);
+        assert_eq!(proxy_encoder_candidates("unknown"), auto);
+        assert_eq!(
+            proxy_encoder_candidates("h264_nvenc"),
+            vec!["h264_nvenc", "libx264"]
+        );
+        assert_eq!(
+            proxy_encoder_candidates("h264_amf"),
+            vec!["h264_amf", "libx264"]
+        );
+        assert_eq!(
+            proxy_encoder_candidates("h264_qsv"),
+            vec!["h264_qsv", "libx264"]
+        );
+        assert_eq!(proxy_encoder_candidates("libx264"), vec!["libx264"]);
+    }
+
+    #[test]
+    fn proxy_encoder_candidates_exclude_hevc_for_webview_playback() {
+        // hevc_videotoolbox is a valid export preference, but a proxy
+        // must stay H.264: the WebView preview cannot decode HEVC on
+        // every platform. It resolves to the automatic H.264 order.
+        assert_eq!(
+            proxy_encoder_candidates("hevc_videotoolbox"),
+            vec!["h264_nvenc", "h264_amf", "h264_qsv", "libx264"]
+        );
+        assert!(!proxy_encoder_candidates("auto").contains(&"hevc_videotoolbox"));
+    }
+
+    #[test]
+    fn hardware_encoder_detection() {
+        assert!(is_hardware_encoder("h264_nvenc"));
+        assert!(is_hardware_encoder("h264_amf"));
+        assert!(is_hardware_encoder("h264_qsv"));
+        assert!(!is_hardware_encoder("libx264"));
+        assert!(!is_hardware_encoder("hevc_videotoolbox"));
+        assert!(!is_hardware_encoder(""));
+    }
+
+    #[test]
+    fn ffmpeg_encoder_list_parsing_keeps_only_names() {
+        let output = "Encoders:\n V..... = Video\n A..... = Audio\n S..... = Subtitle\n ------\n V..... libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10\n V..... h264_nvenc           NVIDIA NVENC H.264 encoder\n A..... aac                  AAC (Advanced Audio Coding)\n";
+        assert_eq!(
+            parse_ffmpeg_encoders(output),
+            vec!["libx264", "h264_nvenc", "aac"]
+        );
+        assert!(parse_ffmpeg_encoders("").is_empty());
+        assert!(parse_ffmpeg_encoders("Encoders:\n ------\n").is_empty());
+    }
+
+    #[test]
+    fn encoder_selection_prefers_first_available_hardware() {
+        let available = vec!["h264_qsv".to_string(), "libx264".to_string()];
+        let selection = select_encoder("auto", &available);
+        assert_eq!(selection.encoder, "h264_qsv");
+        assert!(selection.hardware);
+        assert!(selection.note.contains("h264_qsv"));
+    }
+
+    #[test]
+    fn encoder_selection_falls_back_to_cpu_with_a_clear_note() {
+        let available = vec!["libx264".to_string()];
+        let selection = select_encoder("auto", &available);
+        assert_eq!(selection.encoder, "libx264");
+        assert!(!selection.hardware);
+        assert!(selection.note.contains("No hardware encoder detected"));
+        let explicit = select_encoder("h264_nvenc", &available);
+        assert_eq!(explicit.encoder, "libx264");
+        assert!(!explicit.hardware);
+        assert!(explicit.note.contains("h264_nvenc is unavailable"));
+    }
+
+    #[test]
+    fn encoder_selection_honours_an_explicit_cpu_choice() {
+        let available = vec!["h264_nvenc".to_string(), "libx264".to_string()];
+        let selection = select_encoder("libx264", &available);
+        assert_eq!(selection.encoder, "libx264");
+        assert!(!selection.hardware);
+        assert!(selection.note.contains("selected in preferences"));
+    }
+
+    #[test]
+    fn encoder_selection_reports_no_working_encoder() {
+        let selection = select_encoder("auto", &[]);
+        assert_eq!(selection.encoder, "libx264");
+        assert!(!selection.hardware);
+        assert!(selection.note.contains("No working encoder detected"));
+    }
+
+    #[test]
+    fn encoder_selection_round_trips_through_json() {
+        let selection = select_encoder("auto", &["libx264".to_string()]);
+        let json = serde_json::to_string(&selection).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EncoderSelection>(&json).unwrap(),
+            selection
+        );
+    }
+
+    #[test]
+    fn proxy_encoder_quality_args_are_encoder_specific() {
+        assert_eq!(
+            proxy_encoder_quality_args("libx264"),
+            vec!["-preset", "veryfast", "-crf", "23"]
+        );
+        assert_eq!(
+            proxy_encoder_quality_args("h264_nvenc"),
+            vec!["-preset", "fast", "-cq", "23"]
+        );
+        assert_eq!(
+            proxy_encoder_quality_args("h264_qsv"),
+            vec!["-preset", "veryfast", "-global_quality", "23"]
+        );
+        assert_eq!(
+            proxy_encoder_quality_args("h264_amf"),
+            vec!["-quality", "speed", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23"]
+        );
+        // Unknown encoders fall back to the software encoder flags.
+        assert_eq!(
+            proxy_encoder_quality_args("h264_vaapi"),
+            vec!["-preset", "veryfast", "-crf", "23"]
         );
     }
 }
