@@ -137,12 +137,25 @@ async fn director_propose(
     instruction: String,
     consent: bool,
     mode: String,
+    previous_proposal_id: Option<String>,
+    previous_edl: Option<studiocut_ai::edl::Edl>,
+    learned_preferences: Option<String>,
 ) -> Result<studiocut_ai::director::Proposal, String> {
     use tauri::Manager;
     license_gate(&app)?;
     if mode != "edit" && mode != "titles" {
         return Err("Director mode must be \"edit\" or \"titles\"".into());
     }
+    // A revision needs both the previous id and its EDL; with only one
+    // present, both are ignored and the proposal starts fresh.
+    let previous = match (previous_proposal_id, previous_edl) {
+        (Some(id), Some(edl)) => Some(studiocut_ai::director::PreviousProposal {
+            summary: edl.summary.clone(),
+            id,
+            edl,
+        }),
+        _ => None,
+    };
     let project = analysis_snapshot(&state, project_id, revision)?;
     tauri::async_runtime::spawn_blocking(move || {
         let ai = app.state::<AiState>();
@@ -153,6 +166,8 @@ async fn director_propose(
             instruction,
             consent,
             mode.as_str(),
+            previous,
+            learned_preferences,
         )
     })
     .await
@@ -202,6 +217,23 @@ fn director_apply(state: State<Workspace>, edl: studiocut_ai::edl::Edl) -> Resul
     )?;
     *current = Some(next.clone());
     Ok(next)
+}
+
+/// Loudness of one clip (ffmpeg loudnorm), with a suggested gain to
+/// reach −14 LUFS. Suggestion only — audio is never modified.
+#[tauri::command]
+async fn measure_loudness(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+) -> Result<studiocut_ai::agents::Loudness, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::agents::measure_loudness(&project, clip_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1020,6 +1052,7 @@ fn main() {
             director_context,
             director_credential,
             director_propose,
+            measure_loudness,
             list_director_models,
             extract_thumbnail,
             director_apply,
