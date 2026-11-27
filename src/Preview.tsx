@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { native, useProject } from './store';
+import { reframeFocusAt } from './analysis';
 import { getEncoderPreference } from './preferences';
 import { audible, timelineEnd } from './timeline';
 import { mediaUrl, TimelinePlayer } from './playback';
@@ -9,7 +10,7 @@ import { EffectPreview } from './EffectPreview';
 import { PROXY_TOGGLED_EVENT, isProxyPreferred } from './ProxyToggle';
 
 export function Preview() {
-  const { project, playing, frame } = useProject();
+  const { project, playing, frame, faceTracks } = useProject();
   const video = useRef<HTMLVideoElement>(null);
   const image = useRef<HTMLImageElement>(null);
   const [url, setUrl] = useState('');
@@ -51,6 +52,14 @@ export function Preview() {
   const audioCovered = project?.tracks.some(t => t.kind === 'audio' && audible(t, project.tracks) && t.clips.some(c => c.assetId === asset?.id && c.start <= frame && c.start + c.duration > frame)) ?? false;
   const zoom = zoomAt(active?.effects?.zoom ?? [], frame - (active?.start ?? 0) + (active?.sourceIn ?? 0));
   const transform = { transform: `scale(${zoom.scale})`, transformOrigin: `${zoom.x * 100}% ${zoom.y * 100}%` };
+  // Face-tracked reframe preview: when the active clip has a saved
+  // face-tracked plan (Analysis §07), the monitor shows the plan's
+  // target aspect with the media cover-cropped and panned to the
+  // tracked face at the playhead. CSS approximation only — the exact
+  // crop is applied by FFmpeg on export.
+  const facePlan = active && faceTracks[active.id]?.method === 'face-tracked' ? faceTracks[active.id] : undefined;
+  const faceFocus = facePlan && active && project ? reframeFocusAt(facePlan, (frame - active.start) / project.settings.fps) : null;
+  const stageStyle: CSSProperties = facePlan ? { ...transform, aspectRatio: facePlan.target === '9:16' ? '9 / 16' : '1 / 1', height: '100%', width: 'auto', maxWidth: '100%' } : transform;
   // CSS-filter approximation of the finishing grade (brightness/contrast/
   // saturation) on the media element only — the LUT canvas overlay is a
   // sibling and is not filtered. Approximation only: the exact grade is
@@ -58,6 +67,9 @@ export function Preview() {
   const finishing = active?.effects?.finishing;
   const grade = finishing && (finishing.brightness !== 0 || finishing.contrast !== 1 || finishing.saturation !== 1)
     ? `brightness(${1 + finishing.brightness}) contrast(${finishing.contrast}) saturate(${finishing.saturation})` : '';
+  // The face-tracked media style combines the grade filter with the
+  // cover-crop pan; it must come after `grade` is defined.
+  const mediaStyle: CSSProperties | undefined = faceFocus || grade ? { ...(grade ? { filter: grade } : {}), ...(faceFocus ? { objectFit: 'cover', objectPosition: `${faceFocus.x * 100}% ${faceFocus.y * 100}%`, width: '100%', height: '100%' } : {}) } : undefined;
   const captions = project?.tracks.filter(t => t.kind === 'caption' && audible(t, project.tracks)).flatMap(t => t.clips).filter(c => frame >= c.start && frame < c.start + c.duration) ?? [];
   useEffect(() => {
     let cancelled = false;
@@ -102,7 +114,7 @@ export function Preview() {
     return () => element.removeEventListener('loadedmetadata', synchronize);
   }, [frame, playing, active, project, url, audioCovered]);
   return <section className="preview-player" aria-label="Program preview"><div className="preview-heading"><span>PROGRAM MONITOR</span><span>{project?.settings.width} × {project?.settings.height}</span></div><div className="preview-screen">
-    {sourceError ? <p role="alert">{sourceError}</p> : asset && url ? <div className="effect-stage" style={transform}>{asset.kind === 'image' ? <img ref={image} src={url} alt={asset.name} style={grade ? { filter: grade } : undefined} /> : <video ref={video} src={url} playsInline preload="auto" style={grade ? { filter: grade } : undefined} onError={() => { setSourceError('This video codec is not supported by this WebView. Use an H.264 MP4 or WebM source.'); useProject.setState({ playing: false }); }} />}{active?.effects?.lut && <EffectPreview key={`${url}:${active.effects.lut}`} source={asset.kind === 'image' ? image : video} image={asset.kind === 'image'} preset={active.effects.lut} frame={frame} />}</div> : <div className="preview-empty"><span>{asset ? 'Loading source…' : 'StudioCut'}</span><p>{project && timelineEnd(project.tracks) ? 'No visible video at the playhead' : 'Add a clip to begin your edit'}</p></div>}
+    {sourceError ? <p role="alert">{sourceError}</p> : asset && url ? <div className="effect-stage" style={stageStyle}>{asset.kind === 'image' ? <img ref={image} src={url} alt={asset.name} style={mediaStyle} /> : <video ref={video} src={url} playsInline preload="auto" style={mediaStyle} onError={() => { setSourceError('This video codec is not supported by this WebView. Use an H.264 MP4 or WebM source.'); useProject.setState({ playing: false }); }} />}{active?.effects?.lut && <EffectPreview key={`${url}:${active.effects.lut}`} source={asset.kind === 'image' ? image : video} image={asset.kind === 'image'} preset={active.effects.lut} frame={frame} />}</div> : <div className="preview-empty"><span>{asset ? 'Loading source…' : 'StudioCut'}</span><p>{project && timelineEnd(project.tracks) ? 'No visible video at the playhead' : 'Add a clip to begin your edit'}</p></div>}
     {captions.map(c => <div key={c.id} className={`caption-overlay caption-${c.caption!.preset}`} aria-label="Captions">{c.caption!.words.filter(w => w.end > c.sourceIn && w.start < c.sourceIn + c.duration).map((word, i) => <span key={i} className={frame - c.start + c.sourceIn >= word.start && frame - c.start + c.sourceIn < word.end ? 'active-word' : ''}>{word.text}</span>)}</div>)}
-  </div><div className="preview-footer"><span>{active ? asset?.name : 'Black / silence through timeline gaps'}</span>{grade && <span>Grade preview is approximate — exact grade applies on export</span>}{encoderNote && <span>{encoderNote}</span>}<span>{playing ? 'Playing · audio clock' : 'Paused'}</span></div></section>;
+  </div><div className="preview-footer"><span>{active ? asset?.name : 'Black / silence through timeline gaps'}</span>{grade && <span>Grade preview is approximate — exact grade applies on export</span>}{facePlan && <span>Face-tracked {facePlan.target} preview is approximate — the exact crop applies on export</span>}{encoderNote && <span>{encoderNote}</span>}<span>{playing ? 'Playing · audio clock' : 'Paused'}</span></div></section>;
 }

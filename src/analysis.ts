@@ -8,6 +8,36 @@ export type Scene = { start: number; end: number; score: number | null };
 /** A scene expressed in timeline frames, as the rough-cut IPC takes it. */
 export type SceneCut = { start: number; end: number; score: number | null };
 export type RoughCut = { cuts: Cut[]; hook: Cut | null };
+/** One keyframe of a face-tracked reframe plan: at `tSeconds` into the
+ * clip the crop is centred on (`focusX`, `focusY`) in normalised
+ * frame coordinates. Mirrors the Rust `ReframeKeyframe`. */
+export type ReframeKeyframe = { tSeconds: number; focusX: number; focusY: number };
+/** Auto-reframe plan from the Rust backend. `keyframes` and
+ * `faceConfidence` are only set for face-tracked plans (`method ===
+ * 'face-tracked'`); older plans omit them, so treat both as optional
+ * when reading plans from anywhere but the live IPC. */
+export type ReframePlan = { method: string; target: string; sourceWidth: number; sourceHeight: number; crop: { x: number; y: number; width: number; height: number }; ffmpegFilter: string; motionConfidence: number | null; keyframes: ReframeKeyframe[]; faceConfidence: number | null; note: string };
+/** Focus point of a face-tracked plan at `tSeconds` into the clip,
+ * linearly interpolated between the neighbouring keyframes and
+ * clamped to the track ends. Returns null when the plan has no
+ * keyframes. The Rust side has the same interpolation
+ * (`face::interpolate_focus`). */
+export function reframeFocusAt(plan: ReframePlan, tSeconds: number): { x: number; y: number } | null {
+  const keys = plan.keyframes ?? [];
+  if (!keys.length) return null;
+  if (tSeconds <= keys[0].tSeconds) return { x: keys[0].focusX, y: keys[0].focusY };
+  const last = keys[keys.length - 1];
+  if (tSeconds >= last.tSeconds) return { x: last.focusX, y: last.focusY };
+  for (let i = 0; i + 1 < keys.length; i++) {
+    const a = keys[i], b = keys[i + 1];
+    if (tSeconds >= a.tSeconds && tSeconds <= b.tSeconds) {
+      const span = b.tSeconds - a.tSeconds;
+      const f = span > 0 ? (tSeconds - a.tSeconds) / span : 0;
+      return { x: a.focusX + (b.focusX - a.focusX) * f, y: a.focusY + (b.focusY - a.focusY) * f };
+    }
+  }
+  return { x: last.focusX, y: last.focusY };
+}
 
 export function rippleDelete(project: Project, cuts: Cut[]): Project {
   const end = timelineEnd(project.tracks);

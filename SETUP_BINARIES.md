@@ -123,6 +123,7 @@ model you chose.
 | libass available for caption burn-in | `ffmpeg -filters | grep subtitles` |
 | whisper-cli present | Settings › Transcription › Check availability |
 | Model loads | same check, with the GGML model path set |
+| Face tracking available | Analysis §07 — the capability line reports the BlazeFace model as available (no setup needed; the model is bundled, see below) |
 | Export works end-to-end | open a project, Export a short 1080p MP4, then inspect it with `ffprobe` |
 
 ## 4. Troubleshooting
@@ -135,3 +136,16 @@ model you chose.
   prints there (missing DLL, wrong architecture, corrupt model) is the cause.
 - **Cloud providers grey out / error** — keys are set in **Settings › API keys**;
   they are stored in the OS credential manager and are never written to projects.
+
+## 5. Bundled face-detection model (no setup needed)
+
+Face-tracked auto-reframe uses a BlazeFace full-range model that ships
+inside the app — there is nothing to install or configure. The model
+file lives in the repository at
+`src-tauri/assets/face-detection/blaze_face_full_range.onnx` with its
+Apache-2.0 license and a README recording the official source URL,
+SHA-256 values, input/output specification, training-data provenance
+(consented images, not WIDER FACE), and the in-house conversion from
+the official `.tflite`. If Analysis §07 reports face tracking as
+unavailable, the bundled model failed to load; the capability message
+states the reason.
