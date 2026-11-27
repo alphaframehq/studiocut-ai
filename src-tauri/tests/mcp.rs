@@ -84,7 +84,9 @@ fn remote_url_rules_cover_credentials_query_fragment_and_scheme() {
     assert!(validate_remote_url("https://token@example.com/mcp").is_err());
     assert!(validate_remote_url("https://example.com").is_ok());
     assert!(validate_remote_url("not a url").is_err());
-    assert!(validate_remote_url("https://example.com/".to_string() + &"a".repeat(3000)).is_err());
+    assert!(
+        validate_remote_url(&("https://example.com/".to_string() + &"a".repeat(3000))).is_err()
+    );
 }
 
 #[test]
