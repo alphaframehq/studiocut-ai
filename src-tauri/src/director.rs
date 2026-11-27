@@ -155,7 +155,7 @@ pub struct DirectorListedModel {
     pub note: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectorModelsResponse {
     pub models: Vec<DirectorListedModel>,

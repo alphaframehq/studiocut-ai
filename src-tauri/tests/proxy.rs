@@ -5,12 +5,12 @@
 
 use std::{fs, path::Path, process::Command};
 use studiocut_ai::{
-    media::import_media,
+    media::{ffmpeg_path, import_media},
     proxy::{delete_proxy, generate_proxy, proxy_path_for, proxy_source, proxy_status, ProxyState},
 };
 
 fn video_fixture(path: &Path, size: &str) {
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -36,7 +36,7 @@ fn video_fixture(path: &Path, size: &str) {
 }
 
 fn audio_fixture(path: &Path) {
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",

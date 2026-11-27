@@ -1028,19 +1028,14 @@ fn tool_runs(command: &str) -> bool {
 }
 
 /// First-run check: are the external tools the editor needs actually
-/// installed? Mirrors the lib's resolution (FFMPEG_PATH/FFPROBE_PATH win,
-/// otherwise the bare name on PATH). No keys, no network, no downloads.
+/// installed? Uses the lib's resolution (bundled sidecar first, then
+/// FFMPEG_PATH/FFPROBE_PATH, otherwise the bare name on PATH). No keys,
+/// no network, no downloads.
 #[tauri::command]
 async fn setup_status(binary: String, model: String) -> Result<SetupStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let ffmpeg = std::env::var("FFMPEG_PATH")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| tool_runs("ffmpeg"), |p| tool_runs(&p));
-        let ffprobe = std::env::var("FFPROBE_PATH")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| tool_runs("ffprobe"), |p| tool_runs(&p));
+        let ffmpeg = tool_runs(&studiocut_ai::media::ffmpeg_path());
+        let ffprobe = tool_runs(&studiocut_ai::media::ffprobe_path());
         let whisper_cli = !binary.trim().is_empty() && tool_runs(binary.trim());
         let whisper_model =
             !model.trim().is_empty() && std::path::Path::new(model.trim()).is_file();
@@ -1306,7 +1301,13 @@ fn main() {
             studiocut_ai::mcp::mcp_higgsfield_submit,
             studiocut_ai::mcp::mcp_higgsfield_status,
             studiocut_ai::mcp::mcp_higgsfield_cancel,
-            studiocut_ai::mcp::mcp_download_result
+            studiocut_ai::mcp::mcp_download_result,
+            studiocut_ai::api_connections::list_api_connections,
+            studiocut_ai::api_connections::add_api_connection,
+            studiocut_ai::api_connections::update_api_connection,
+            studiocut_ai::api_connections::delete_api_connection,
+            studiocut_ai::api_connections::test_api_connection,
+            studiocut_ai::api_connections::list_connection_models
         ])
         .run(tauri::generate_context!())
         .expect("Failed to launch StudioCut AI");

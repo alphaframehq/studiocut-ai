@@ -95,23 +95,70 @@ pub fn open_index(root: &Path) -> Result<Connection, String> {
     Ok(db)
 }
 
-/// Resolve the ffmpeg binary: `FFMPEG_PATH` wins when set to a non-empty
-/// value, otherwise fall back to the `ffmpeg` on PATH.
+/// File name of a bundled sidecar binary. Windows sidecars carry the
+/// `.exe` suffix; the other platforms ship the bare name.
+fn sidecar_file_name(tool: &str, windows: bool) -> String {
+    if windows {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    }
+}
+
+/// Pure path logic for tool resolution, testable without a real binary or
+/// environment mutation. Resolution order:
+/// 1. bundled sidecar next to the app executable (`exe_dir`),
+/// 2. the `FFMPEG_PATH` / `FFPROBE_PATH` override when non-empty,
+/// 3. the bare tool name, resolved on PATH at spawn time.
+pub fn resolve_tool_path(tool: &str, env_override: Option<&str>, exe_dir: Option<&Path>) -> String {
+    resolve_tool_path_for_platform(tool, env_override, exe_dir, cfg!(windows))
+}
+
+fn resolve_tool_path_for_platform(
+    tool: &str,
+    env_override: Option<&str>,
+    exe_dir: Option<&Path>,
+    windows: bool,
+) -> String {
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join(sidecar_file_name(tool, windows));
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(value) = env_override.filter(|v| !v.trim().is_empty()) {
+        return value.to_string();
+    }
+    tool.to_string()
+}
+
+/// Directory holding the running executable; the bundled sidecars live
+/// next to it. `None` when the executable path cannot be determined.
+fn executable_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+}
+
+/// Resolve the ffmpeg binary: bundled sidecar first, then `FFMPEG_PATH`
+/// when set to a non-empty value, otherwise the `ffmpeg` on PATH.
 /// (SETUP_BINARIES.md documents these variables; before this, every call
 /// site spawned bare `"ffmpeg"` and the documented variables did nothing.)
-pub(crate) fn ffmpeg_path() -> String {
-    std::env::var("FFMPEG_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_string())
+pub fn ffmpeg_path() -> String {
+    resolve_tool_path(
+        "ffmpeg",
+        std::env::var("FFMPEG_PATH").ok().as_deref(),
+        executable_dir().as_deref(),
+    )
 }
 
 /// Same as [`ffmpeg_path`] for ffprobe (`FFPROBE_PATH`).
-pub(crate) fn ffprobe_path() -> String {
-    std::env::var("FFPROBE_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "ffprobe".to_string())
+pub fn ffprobe_path() -> String {
+    resolve_tool_path(
+        "ffprobe",
+        std::env::var("FFPROBE_PATH").ok().as_deref(),
+        executable_dir().as_deref(),
+    )
 }
 
 /// Resolve a tool name (`"ffmpeg"` / `"ffprobe"`) to the binary that should
@@ -610,4 +657,82 @@ pub fn media_preview(root: &Path, asset: &Asset) -> Result<Preview, String> {
         None
     };
     Ok(Preview { thumbnail, peaks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Temporary directory containing one fake sidecar file.
+    fn sidecar_dir(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(name), b"fake binary").unwrap();
+        dir
+    }
+
+    #[test]
+    fn sidecar_present_wins_over_env_override() {
+        let dir = sidecar_dir("ffmpeg");
+        assert_eq!(
+            resolve_tool_path("ffmpeg", Some("/custom/ffmpeg"), Some(dir.path())),
+            dir.path().join("ffmpeg").to_string_lossy().into_owned()
+        );
+    }
+
+    #[test]
+    fn env_override_wins_over_path_fallback() {
+        assert_eq!(
+            resolve_tool_path("ffmpeg", Some("/custom/ffmpeg"), None),
+            "/custom/ffmpeg"
+        );
+        assert_eq!(
+            resolve_tool_path("ffprobe", Some("/custom/ffprobe"), None),
+            "/custom/ffprobe"
+        );
+    }
+
+    #[test]
+    fn empty_env_override_is_ignored() {
+        assert_eq!(resolve_tool_path("ffmpeg", Some(""), None), "ffmpeg");
+        assert_eq!(resolve_tool_path("ffprobe", Some("   "), None), "ffprobe");
+    }
+
+    #[test]
+    fn missing_sidecar_falls_through_to_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_tool_path("ffmpeg", Some("/custom/ffmpeg"), Some(dir.path())),
+            "/custom/ffmpeg"
+        );
+    }
+
+    #[test]
+    fn no_sidecar_and_no_env_falls_back_to_bare_name_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_tool_path("ffprobe", None, Some(dir.path())),
+            "ffprobe"
+        );
+        assert_eq!(resolve_tool_path("ffmpeg", None, None), "ffmpeg");
+    }
+
+    #[test]
+    fn windows_sidecar_uses_exe_suffix() {
+        let dir = sidecar_dir("ffmpeg.exe");
+        assert_eq!(
+            resolve_tool_path_for_platform(
+                "ffmpeg",
+                Some("/custom/ffmpeg"),
+                Some(dir.path()),
+                true
+            ),
+            dir.path().join("ffmpeg.exe").to_string_lossy().into_owned()
+        );
+        // A bare `ffmpeg` file does not count as the Windows sidecar.
+        let plain = sidecar_dir("ffmpeg");
+        assert_eq!(
+            resolve_tool_path_for_platform("ffmpeg", None, Some(plain.path()), true),
+            "ffmpeg"
+        );
+    }
 }

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { native, useProject } from './store';
 import { compileEdl, parseEdl, summarize, type Edl, type Operation } from './edl';
 import { addDirectorHistory, buildLearnedPreferences, directorOpLabel, getCachedDirectorModels, getDirectorFeedback, getDirectorHistory, getDirectorModel, maybeUpdateStyleDnaFromFeedback, recordDirectorFeedback, recordPaceFeedback, recordPresetFeedback, resetDirectorFeedback, setCachedDirectorModels, setDirectorModel, type DirectorFeedback, type DirectorHistoryEntry, type DirectorListedModel } from './preferences';
+import { fetchApiConnections, type ApiConnection } from './ApiConnectionsPanel';
 import './director.css';
 
 type Provider = 'gemini' | 'openai' | 'claude' | 'groq' | 'openrouter' | 'compatible' | 'ollama' | 'bedrock' | 'vertex';
@@ -94,6 +95,9 @@ export function DirectorPanel() {
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
   const [history, setHistory] = useState<DirectorHistoryEntry[]>([]);
   const [hasKey, setHasKey] = useState(false);
+  const [savedConnections, setSavedConnections] = useState<ApiConnection[]>([]);
+  const [savedConnectionId, setSavedConnectionId] = useState('');
+  const [connectionKeyNote, setConnectionKeyNote] = useState('');
   useEffect(() => { setConsent(false); setContext(null); setProposal(null); setProposalId(null); setContinuing(null); setChecked([]); setPendingModifiedOp(null); setRoughCutApplied(false); setPolishUnlocked(false); setLearnedRecorded({ preset: false, pace: false }); setTitles(null); setLoudness(''); setLoudnessError(''); }, [project?.id]);
   useEffect(() => { if (project) setHistory(getDirectorHistory(project.id)); }, [project?.id]);
   useEffect(() => { setConsent(false); setHasKey(false); if (key.current) key.current.value = ''; }, [config.provider, config.endpoint]);
@@ -130,7 +134,27 @@ export function DirectorPanel() {
     const persisted = getDirectorModel(p) ?? '';
     setConfig({ provider: p, model: persisted, endpoint: p === 'ollama' ? 'http://127.0.0.1:11434/api/chat' : '', maxTokens: 4096 });
     setModels([]); setModelsError(''); setModelsNote(''); setModelMode('list'); setCustomModel('');
+    setSavedConnectionId(''); setConnectionKeyNote('');
+    if (p === 'compatible' && native) void fetchApiConnections().then(setSavedConnections).catch(() => setSavedConnections([]));
     void refreshModels(p, '', p === 'ollama' ? 'http://127.0.0.1:11434/api/chat' : '', false, persisted);
+  }
+  // Fill the endpoint (and the key, only if the backend returns one) from
+  // a saved connection. This is an explicit pick: nothing is switched
+  // automatically, and the manual URL/key fields keep working.
+  function pickSavedConnection(id: string) {
+    setSavedConnectionId(id);
+    setConnectionKeyNote('');
+    if (!id) return;
+    const connection = savedConnections.find(c => c.id === id);
+    if (!connection) return;
+    setConfig(c => ({ ...c, endpoint: connection.baseUrl }));
+    const returnedKey = (connection as { key?: string }).key;
+    if (returnedKey && key.current) {
+      key.current.value = returnedKey;
+      setHasKey(true);
+    } else {
+      setConnectionKeyNote('The key for this connection is stored by the app and is not shown here. Re-enter the key below if this request needs one.');
+    }
   }
   function pickModel(id: string) {
     if (id === '__custom') { setModelMode('custom'); return; }
@@ -319,7 +343,8 @@ export function DirectorPanel() {
         <button className="button secondary" disabled={!native || modelsLoading || (cloud && !hasKey && !['claude', 'bedrock', 'vertex'].includes(config.provider))} onClick={() => void refreshModels(config.provider, key.current?.value ?? '', config.endpoint, true, config.model)}>{modelsLoading ? 'Loading models…' : 'Refresh models'}</button>
         {modelsNote && <p>{modelsNote}</p>}
         {modelsError && <p role="alert" className="error">{modelsError}</p>}
-        {['compatible', 'ollama', 'bedrock', 'vertex'].includes(config.provider) && <label>Full API endpoint<input value={config.endpoint} onChange={e => setConfig({ ...config, endpoint: e.target.value })} placeholder={config.provider === 'compatible' ? 'https://your-host/v1/chat/completions' : 'Full model request URL'} /></label>}
+        {config.provider === 'compatible' && <><label>Saved connection<select value={savedConnectionId} disabled={!native} onChange={e => pickSavedConnection(e.target.value)}><option value="">Choose a saved connection…</option>{savedConnections.map(c => <option key={c.id} value={c.id}>{c.name} — {c.baseUrl}</option>)}</select></label>{connectionKeyNote && <p>{connectionKeyNote}</p>}</>}
+        {['compatible', 'ollama', 'bedrock', 'vertex'].includes(config.provider) && <label>Full API endpoint<input value={config.endpoint} onChange={e => { setConfig({ ...config, endpoint: e.target.value }); setSavedConnectionId(''); }} placeholder={config.provider === 'compatible' ? 'https://your-host/v1/chat/completions' : 'Full model request URL'} /></label>}
         {config.provider === 'bedrock' && <p>Uses a Bedrock API key (bearer token), not an AWS access-key/secret pair.</p>}
         {config.provider === 'vertex' && <p>Uses a Google OAuth access token. Tokens expire; replace yours when needed. Use the Google publisher generateContent endpoint.</p>}
         {cloud && <><label>Credential storage<select value={storage} disabled={!native} onChange={e => setStorage(e.target.value as 'os' | 'session')}><option value="os">OS credential store (recommended)</option><option value="session">Session only — cleared on app exit</option></select></label><label>API key / access token<input ref={key} type="password" autoComplete="off" spellCheck={false} disabled={!native} maxLength={8192} onChange={e => setHasKey(!!e.target.value)} placeholder={native ? 'Stored only by Rust, never in project data' : 'Available in the desktop app'} /></label><div className="director-actions"><button className="button secondary" disabled={!native || !config.model} onClick={() => void task(async () => { const secret = key.current?.value; if (key.current) key.current.value = ''; if (!secret) throw new Error('Enter a credential.'); await invoke('director_credential', { config, key: secret, storage }); setStatus(storage === 'os' ? 'Saved in the OS credential store.' : 'Stored in Rust memory for this session only. Existing OS credentials are unchanged.'); })}>Save credential</button><button className="button secondary" disabled={!native || !config.model} onClick={() => void task(async () => { await invoke('director_credential', { config, key: null, storage: null }); setStatus('Saved OS/session credential removed. Environment credentials, if configured, are unchanged.'); })}>Forget credential</button></div><p>No silent fallback: if the OS store is unavailable, explicitly choose Session only and enter the key again.</p></>}

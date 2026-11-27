@@ -8,7 +8,7 @@ use studiocut_ai::{
 fn typescript_edits_roundtrip_in_rust_and_real_audio_decode() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("linked clip.mp4");
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(media::ffmpeg_path())
         .args([
             "-v",
             "error",

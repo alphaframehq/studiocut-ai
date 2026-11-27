@@ -9,6 +9,7 @@ import {
   setMcpSelectedServer,
   type McpServerConfig,
 } from './preferences';
+import { fetchApiConnections, type ApiConnection } from './ApiConnectionsPanel';
 
 type McpPreset = {
   id: string;
@@ -106,6 +107,8 @@ export function McpPanel() {
   const [name, setName] = useState('HyperFrames');
   const [transport, setTransport] = useState<'http' | 'stdio'>('http');
   const [url, setUrl] = useState('https://hyperframes.net/api/mcp');
+  const [savedConnections, setSavedConnections] = useState<ApiConnection[]>([]);
+  const [connectionUrlId, setConnectionUrlId] = useState('');
   const [command, setCommand] = useState('');
   const [storage, setStorage] = useState<'os' | 'session'>('os');
   const keyRef = useRef<HTMLInputElement>(null);
@@ -152,6 +155,7 @@ export function McpPanel() {
         setHfModelsNote(data.note ?? '');
       })
       .catch(() => setHfModels([]));
+    void fetchApiConnections().then(setSavedConnections).catch(() => setSavedConnections([]));
   }, []);
 
   const selectedPreset = presets.find(p => p.id === presetId) ?? null;
@@ -159,6 +163,7 @@ export function McpPanel() {
 
   function applyPreset(id: string) {
     setPresetId(id);
+    setConnectionUrlId('');
     const preset = presets.find(p => p.id === id);
     if (!preset) return;
     if (preset.kind === 'mcpHttp' && preset.url) {
@@ -172,6 +177,15 @@ export function McpPanel() {
       setCommand(preset.command ?? '');
       setName(preset.kind === 'custom' ? '' : preset.name);
     }
+  }
+
+  // Fill the server URL from a saved API connection. This is an explicit
+  // pick: the URL field stays editable afterwards, and nothing is switched
+  // automatically.
+  function pickConnectionUrl(id: string) {
+    setConnectionUrlId(id);
+    const connection = savedConnections.find(c => c.id === id);
+    if (connection) setUrl(connection.baseUrl);
   }
 
   async function task<T>(fn: () => Promise<T>): Promise<T | null> {
@@ -508,7 +522,8 @@ export function McpPanel() {
         <label>Server name<input value={name} onChange={e => setName(e.target.value)} maxLength={120} placeholder="HyperFrames" /></label>
         <label>Transport<select value={transport} onChange={e => setTransport(e.target.value as 'http' | 'stdio')}><option value="http">Remote (Streamable HTTP)</option><option value="stdio">Local (stdio command)</option></select></label>
         {transport === 'http'
-          ? <label>Server URL<input value={url} onChange={e => setUrl(e.target.value)} spellCheck={false} placeholder="https://hyperframes.net/api/mcp" maxLength={2048} /></label>
+          ? <><label>Server URL<input value={url} onChange={e => { setUrl(e.target.value); setConnectionUrlId(''); }} spellCheck={false} placeholder="https://hyperframes.net/api/mcp" maxLength={2048} /></label>
+            {presetId === 'custom' && savedConnections.length > 0 && <label>Saved connection (URL source)<select value={connectionUrlId} onChange={e => pickConnectionUrl(e.target.value)}><option value="">Choose a saved connection…</option>{savedConnections.map(c => <option key={c.id} value={c.id}>{c.name} — {c.baseUrl}</option>)}</select></label>}</>
           : <label>Command<input value={command} onChange={e => setCommand(e.target.value)} spellCheck={false} placeholder="npx -y my-mcp-server" maxLength={4096} /></label>}
         <div className="director-actions"><button className="button secondary" disabled={!name.trim()} onClick={addServer}>Add server</button></div>
         <p>Remote servers require HTTPS; plain HTTP is accepted only for localhost. Local servers run as a child process and are terminated after each operation.</p>
