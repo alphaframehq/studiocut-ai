@@ -1,8 +1,10 @@
 use std::{fs, path::Path, process::Command, time::Instant};
-use studiocut_ai::media::{import_media, media_preview, open_index, MIGRATE_DOWN, MIGRATE_UP};
+use studiocut_ai::media::{
+    ffmpeg_path, import_media, media_preview, open_index, MIGRATE_DOWN, MIGRATE_UP,
+};
 
 fn fixture(path: &Path, audio_only: bool) {
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(ffmpeg_path());
     command.args([
         "-v",
         "error",
@@ -81,7 +83,7 @@ fn real_import_metadata_thumbnail_waveform_and_deduplication() {
     assert_eq!(sound.kind, "audio");
     assert!(media_preview(&root, &sound).unwrap().thumbnail.is_none());
     let image = directory.path().join("still.png");
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -103,7 +105,7 @@ fn real_import_metadata_thumbnail_waveform_and_deduplication() {
     assert!(still.duration.is_none());
     assert!(media_preview(&root, &still).unwrap().peaks.is_none());
     let silent = directory.path().join("silent.mp4");
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",

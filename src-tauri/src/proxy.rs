@@ -2,10 +2,12 @@
 //! stored in the per-asset media cache next to the thumbnail and waveform
 //! peaks. Originals are never modified, moved or overwritten.
 //!
-//! Export always uses the original media. Proxy use in preview and any
-//! proxy-for-export choice is a separate wiring step; see
-//! [`ProxyStatus`] and the `proxy_playback_source` command notes in
-//! `main.rs`.
+//! Export uses the original media by default. An explicit, opt-in export
+//! choice may render from a ready proxy instead (see [`export_source`]);
+//! the choice defaults off, and a clip without a ready proxy falls back
+//! to its original, so an export never silently uses low-resolution
+//! media. Proxy use in preview is a separate step; see [`ProxyStatus`]
+//! and the `proxy_playback_source` command notes in `main.rs`.
 
 use crate::media::{self, Asset};
 use serde::{Deserialize, Serialize};
@@ -18,8 +20,6 @@ use uuid::Uuid;
 
 /// Proxy height, in pixels. Width follows the source aspect ratio.
 pub const PROXY_HEIGHT: u32 = 540;
-/// Proxy video encoder settings: fast, small, good enough for editing.
-pub const PROXY_CRF: u32 = 23;
 /// File name of the proxy inside the per-asset cache directory.
 pub const PROXY_FILE_NAME: &str = "proxy-540p.mp4";
 /// File name of the proxy state sidecar inside the per-asset cache
@@ -53,6 +53,8 @@ pub struct ProxyStatus {
     pub height: Option<u32>,
     /// Proxy file size in bytes, when ready.
     pub size_bytes: Option<u64>,
+    /// Encoder that produced the proxy file, when recorded.
+    pub encoder: Option<String>,
     /// Failure detail when [`ProxyState::Failed`], otherwise `None`.
     pub error: Option<String>,
 }
@@ -65,6 +67,7 @@ impl ProxyStatus {
             width: None,
             height: None,
             size_bytes: None,
+            encoder: None,
             error: None,
         }
     }
@@ -80,6 +83,10 @@ pub struct ProxyRecord {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub size_bytes: Option<u64>,
+    /// Encoder that produced the proxy file, when recorded. Optional so
+    /// records written before encoder tracking still parse.
+    #[serde(default)]
+    pub encoder: Option<String>,
     pub source_size_bytes: u64,
     pub source_modified_ns: String,
     pub error: Option<String>,
@@ -199,6 +206,7 @@ pub fn proxy_status(root: &Path, asset: &Asset) -> ProxyStatus {
             width: record.width,
             height: record.height,
             size_bytes: record.size_bytes,
+            encoder: record.encoder.clone(),
             error: None,
         };
     }
@@ -208,6 +216,7 @@ pub fn proxy_status(root: &Path, asset: &Asset) -> ProxyStatus {
         width: None,
         height: None,
         size_bytes: None,
+        encoder: record.encoder.clone(),
         error: record.error,
     }
 }
@@ -216,7 +225,15 @@ pub fn proxy_status(root: &Path, asset: &Asset) -> ProxyStatus {
 /// proxy is encoded to a staging file and moved into place only on
 /// success; a failed run leaves the previous proxy untouched and
 /// records the failure. The original file is only read, never written.
-pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String> {
+///
+/// `preference` is the saved encoder preference string (see
+/// `preferences.ts` `getEncoderPreference()`): the encoder is resolved
+/// per generation with `media::resolve_preview_encoder`, hardware first
+/// and libx264 as the fallback, and the quality flags come from
+/// `media::proxy_encoder_quality_args`, so libx264-only flags are never
+/// passed to a hardware encoder. Probing runs on every generation, as
+/// in export; the resolved encoder is recorded on the proxy record.
+pub fn generate_proxy(root: &Path, asset: &Asset, preference: &str) -> Result<ProxyStatus, String> {
     if asset.video_stream.is_none() {
         return Err("Proxies are only generated for video assets".into());
     }
@@ -228,6 +245,7 @@ pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String>
     let source = source.to_str().ok_or("Invalid media path")?;
     let (source_size, source_modified) = source_fingerprint(asset)?;
     let (width, height) = proxy_dimensions(asset.width.unwrap_or(0), asset.height.unwrap_or(0));
+    let selection = media::resolve_preview_encoder(preference);
     write_record(
         root,
         asset.id,
@@ -236,6 +254,7 @@ pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String>
             width: None,
             height: None,
             size_bytes: None,
+            encoder: Some(selection.encoder.clone()),
             source_size_bytes: source_size,
             source_modified_ns: source_modified.clone(),
             error: None,
@@ -273,11 +292,10 @@ pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String>
         owned.push("128k".into());
     }
     owned.push("-c:v".into());
-    owned.push("libx264".into());
-    owned.push("-preset".into());
-    owned.push("veryfast".into());
-    owned.push("-crf".into());
-    owned.push(PROXY_CRF.to_string());
+    owned.push(selection.encoder.clone());
+    for flag in media::proxy_encoder_quality_args(&selection.encoder) {
+        owned.push(flag.into());
+    }
     owned.push("-movflags".into());
     owned.push("+faststart".into());
     owned.push("-n".into());
@@ -296,6 +314,7 @@ pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String>
                         width: None,
                         height: None,
                         size_bytes: None,
+                        encoder: Some(selection.encoder.clone()),
                         source_size_bytes: source_size,
                         source_modified_ns: source_modified,
                         error: Some("Proxy encoder produced an empty file".into()),
@@ -314,6 +333,7 @@ pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String>
                 width: Some(width),
                 height: Some(height),
                 size_bytes: Some(size),
+                encoder: Some(selection.encoder.clone()),
                 source_size_bytes: source_size,
                 source_modified_ns: source_modified,
                 error: None,
@@ -332,6 +352,7 @@ pub fn generate_proxy(root: &Path, asset: &Asset) -> Result<ProxyStatus, String>
                     width: None,
                     height: None,
                     size_bytes: None,
+                    encoder: Some(selection.encoder.clone()),
                     source_size_bytes: source_size,
                     source_modified_ns: source_modified,
                     error: Some(detail),
@@ -369,6 +390,48 @@ pub fn proxy_source(root: &Path, asset: &Asset) -> Result<PathBuf, String> {
         .proxy_path
         .map(PathBuf::from)
         .ok_or_else(|| "No proxy is ready for this asset".to_string())
+}
+
+/// Which file an export should read for one asset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportSource {
+    /// The original media file.
+    Original(PathBuf),
+    /// A ready 540p proxy file for the asset.
+    Proxy(PathBuf),
+}
+
+impl ExportSource {
+    /// The file the export should read.
+    pub fn path(&self) -> &Path {
+        match self {
+            ExportSource::Original(path) | ExportSource::Proxy(path) => path,
+        }
+    }
+
+    /// Whether the export reads a proxy file for this asset.
+    pub fn used_proxy(&self) -> bool {
+        matches!(self, ExportSource::Proxy(_))
+    }
+}
+
+/// Resolve the file an export should read for one asset.
+///
+/// With `use_proxy` off, the original media is always used. With it on,
+/// a ready proxy is used when one exists and still matches the original;
+/// otherwise the export falls back to the original media for that clip.
+/// A proxy is only ever served when its recorded source fingerprint
+/// still matches the original, so a changed original can never silently
+/// serve a stale proxy. Errors only when the original itself is missing
+/// or changed (see [`media::verified_source`]); the original file is
+/// only read, never written.
+pub fn export_source(root: &Path, asset: &Asset, use_proxy: bool) -> Result<ExportSource, String> {
+    if use_proxy {
+        if let Ok(path) = proxy_source(root, asset) {
+            return Ok(ExportSource::Proxy(path));
+        }
+    }
+    Ok(ExportSource::Original(media::verified_source(asset)?))
 }
 
 #[cfg(test)]
@@ -422,6 +485,7 @@ mod tests {
             width: Some(960),
             height: Some(540),
             size_bytes: Some(12345),
+            encoder: Some("h264_nvenc".into()),
             source_size_bytes: 999,
             source_modified_ns: "123".into(),
             error: None,
@@ -429,6 +493,139 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<ProxyRecord>(&json).unwrap(), record);
+        // Records written before encoder tracking omit the field and
+        // still parse, with no encoder recorded.
+        let legacy: ProxyRecord = serde_json::from_str(
+            r#"{"state":"ready","width":960,"height":540,"sizeBytes":12345,"sourceSizeBytes":999,"sourceModifiedNs":"123","error":null,"updatedAtMs":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.encoder, None);
+    }
+
+    /// Asset over a real file, with the fingerprint fields filled from
+    /// the file itself. Returns the asset and its path.
+    fn asset_with_file(directory: &Path, name: &str) -> (Asset, PathBuf) {
+        let path = directory.join(name);
+        fs::write(&path, b"original media bytes").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            source_path: path.to_str().unwrap().into(),
+            name: name.into(),
+            size_bytes: meta.len(),
+            modified_ns: meta
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string(),
+            kind: "video".into(),
+            duration: Some(1.0),
+            width: Some(160),
+            height: Some(90),
+            fps: Some(24.0),
+            video_stream: Some(0),
+            audio_stream: None,
+            video_codec: None,
+            audio_codec: None,
+            sample_rate: None,
+            channels: None,
+            created_at: 0,
+            bin: String::new(),
+        };
+        (asset, path)
+    }
+
+    /// Write the ready-proxy state the generator would record for an
+    /// asset: a proxy file plus a sidecar whose fingerprint matches the
+    /// original. Returns the proxy path.
+    fn write_ready_proxy(root: &Path, asset: &Asset, size: u64) -> PathBuf {
+        let path = proxy_path_for(root, asset.id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![0u8; size as usize]).unwrap();
+        write_record(
+            root,
+            asset.id,
+            &ProxyRecord {
+                state: ProxyState::Ready,
+                width: Some(96),
+                height: Some(54),
+                size_bytes: Some(size),
+                encoder: Some("libx264".into()),
+                source_size_bytes: asset.size_bytes,
+                source_modified_ns: asset.modified_ns.clone(),
+                error: None,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn export_source_off_always_uses_the_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let (asset, path) = asset_with_file(directory.path(), "clip.mp4");
+        let proxy = write_ready_proxy(&root, &asset, 128);
+        let resolved = export_source(&root, &asset, false).unwrap();
+        assert_eq!(resolved, ExportSource::Original(path));
+        assert!(!resolved.used_proxy());
+        assert_ne!(resolved.path(), proxy.as_path());
+    }
+
+    #[test]
+    fn export_source_on_uses_a_ready_proxy() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let (asset, _) = asset_with_file(directory.path(), "clip.mp4");
+        let proxy = write_ready_proxy(&root, &asset, 128);
+        let resolved = export_source(&root, &asset, true).unwrap();
+        assert_eq!(resolved, ExportSource::Proxy(proxy.clone()));
+        assert!(resolved.used_proxy());
+        assert_eq!(resolved.path(), proxy.as_path());
+        assert_eq!(
+            proxy_status(&root, &asset).encoder.as_deref(),
+            Some("libx264")
+        );
+    }
+
+    #[test]
+    fn export_source_on_falls_back_to_the_original_without_a_proxy() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let (asset, path) = asset_with_file(directory.path(), "clip.mp4");
+        assert_eq!(
+            export_source(&root, &asset, true).unwrap(),
+            ExportSource::Original(path)
+        );
+    }
+
+    #[test]
+    fn export_source_on_falls_back_when_the_proxy_file_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let (asset, path) = asset_with_file(directory.path(), "clip.mp4");
+        let proxy = write_ready_proxy(&root, &asset, 128);
+        fs::remove_file(&proxy).unwrap();
+        assert_eq!(
+            export_source(&root, &asset, true).unwrap(),
+            ExportSource::Original(path)
+        );
+    }
+
+    #[test]
+    fn export_source_errors_when_the_original_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let (asset, path) = asset_with_file(directory.path(), "clip.mp4");
+        write_ready_proxy(&root, &asset, 128);
+        // The original changed after the proxy was recorded: the proxy
+        // is stale and the export must fail rather than serve it.
+        fs::write(&path, b"replaced original media bytes").unwrap();
+        let error = export_source(&root, &asset, true).unwrap_err();
+        assert!(error.contains("changed"), "{error}");
     }
 
     #[test]

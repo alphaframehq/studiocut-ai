@@ -25,6 +25,50 @@ type McpPreset = {
 
 type McpTool = { name: string; description?: string | null; inputSchema: unknown };
 
+type FormField = {
+  name: string;
+  fieldType: string;
+  title?: string | null;
+  description?: string | null;
+  required: boolean;
+  default?: unknown;
+  enumValues: unknown[];
+  minimum?: number | null;
+  maximum?: number | null;
+  minLength?: number | null;
+  maxLength?: number | null;
+  itemsType?: string | null;
+};
+
+type OAuthDiscovery = {
+  resource: string;
+  authorizationServers: string[];
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  registrationEndpoint?: string | null;
+  scopesSupported: string[];
+  codeChallengeMethodsSupported: string[];
+  clientIdMetadataDocumentSupported: boolean;
+  grantTypesSupported: string[];
+  responseTypesSupported: string[];
+};
+
+type OAuthClientRegistration = {
+  clientId: string;
+  clientSecret?: string | null;
+  clientIdIssuedAt?: number | null;
+  clientSecretExpiresAt?: number | null;
+};
+
+type OAuthTokenSummary = {
+  tokenType: string;
+  expiresIn?: number | null;
+  hasRefreshToken: boolean;
+  scope?: string | null;
+};
+
+type PkcePair = { verifier: string; challenge: string };
+
 type McpTestResult = {
   serverId: string;
   serverName: string;
@@ -71,6 +115,64 @@ function parseJsonObject(text: string): Record<string, unknown> {
     throw new Error('Parameters must be a JSON object.');
   }
   return parsed as Record<string, unknown>;
+}
+
+function tryParseJsonObject(text: string): Record<string, unknown> {
+  try {
+    return parseJsonObject(text);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Convert a tool inputSchema (JSON Schema) into form fields. This
+ * mirrors `form_fields_from_schema` in src-tauri/src/mcp.rs: fields
+ * come from the server's live tools/list response, never from
+ * parameter names written in this codebase. When the schema has no
+ * properties, the caller falls back to the free-form JSON editor.
+ */
+function fieldsFromSchema(schema: unknown): FormField[] {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return [];
+  const record = schema as Record<string, unknown>;
+  const properties = record.properties;
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return [];
+  const required = new Set(
+    Array.isArray(record.required) ? record.required.filter((r): r is string => typeof r === 'string') : [],
+  );
+  const fieldTypeOf = (property: Record<string, unknown>): string => {
+    const type = property.type;
+    if (['string', 'number', 'integer', 'boolean', 'array', 'object'].includes(type as string)) return type as string;
+    if (Array.isArray(property.enum) && property.enum.length > 0) {
+      const first = property.enum[0];
+      if (typeof first === 'string') return 'string';
+      if (typeof first === 'boolean') return 'boolean';
+      if (typeof first === 'number') return 'number';
+    }
+    return 'string';
+  };
+  return Object.entries(properties as Record<string, unknown>)
+    .filter(([name]) => name.length > 0 && name.length <= 128)
+    .map(([name, raw]) => {
+      const property = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+      const items = property.items && typeof property.items === 'object' && !Array.isArray(property.items)
+        ? (property.items as Record<string, unknown>)
+        : null;
+      return {
+        name,
+        fieldType: fieldTypeOf(property),
+        title: typeof property.title === 'string' ? property.title : null,
+        description: typeof property.description === 'string' ? property.description : null,
+        required: required.has(name),
+        default: property.default,
+        enumValues: Array.isArray(property.enum) ? property.enum : [],
+        minimum: typeof property.minimum === 'number' ? property.minimum : null,
+        maximum: typeof property.maximum === 'number' ? property.maximum : null,
+        minLength: typeof property.minLength === 'number' ? property.minLength : null,
+        maxLength: typeof property.maxLength === 'number' ? property.maxLength : null,
+        itemsType: items && typeof items.type === 'string' ? items.type : null,
+      };
+    });
 }
 
 function extensionOf(url: string): string {
@@ -126,6 +228,13 @@ export function McpPanel() {
   const [hfStatus, setHfStatus] = useState<HiggsfieldStatus | null>(null);
   const [hfPolling, setHfPolling] = useState(false);
   const [downloading, setDownloading] = useState('');
+  const [oauthDiscovery, setOauthDiscovery] = useState<OAuthDiscovery | null>(null);
+  const [oauthClient, setOauthClient] = useState<OAuthClientRegistration | null>(null);
+  const [oauthRedirectUri, setOauthRedirectUri] = useState('http://127.0.0.1:49152/callback');
+  const [oauthUrl, setOauthUrl] = useState('');
+  const [oauthCode, setOauthCode] = useState('');
+  const [oauthToken, setOauthToken] = useState<OAuthTokenSummary | null>(null);
+  const oauthPkceRef = useRef<PkcePair | null>(null);
   const [working, setWorking] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
@@ -156,6 +265,32 @@ export function McpPanel() {
 
   const selectedPreset = presets.find(p => p.id === presetId) ?? null;
   const selectedServer = servers.find(s => s.id === selectedId) ?? null;
+  const selectedToolDef = tools.find(t => t.name === selectedTool) ?? null;
+  const formFields = selectedToolDef ? fieldsFromSchema(selectedToolDef.inputSchema) : [];
+
+  function setParam(name: string, value: unknown): void {
+    const next = tryParseJsonObject(paramsText);
+    if (value === undefined) delete next[name];
+    else next[name] = value;
+    setParamsText(JSON.stringify(next, null, 2));
+  }
+
+  function paramValue(name: string): unknown {
+    return tryParseJsonObject(paramsText)[name];
+  }
+
+  function selectTool(name: string, list: McpTool[] = tools): void {
+    setSelectedTool(name);
+    const tool = list.find(t => t.name === name);
+    const seeded: Record<string, unknown> = {};
+    if (tool) {
+      for (const field of fieldsFromSchema(tool.inputSchema)) {
+        if (field.default !== undefined) seeded[field.name] = field.default;
+      }
+    }
+    setParamsText(JSON.stringify(seeded, null, 2));
+    setToolResult(null);
+  }
 
   function applyPreset(id: string) {
     setPresetId(id);
@@ -230,6 +365,7 @@ export function McpPanel() {
     setTestResult(null);
     setTools([]);
     setSelectedTool('');
+    setParamsText('{}');
     setToolResult(null);
     setPollNote('');
   }
@@ -294,7 +430,8 @@ export function McpPanel() {
     if (result) {
       setTestResult(result);
       setTools(result.tools);
-      if (result.tools.length > 0) setSelectedTool(result.tools[0].name);
+      if (result.tools.length > 0) selectTool(result.tools[0].name, result.tools);
+      if (result.tools.some(t => t.name === 'get_generation')) setStatusTool('get_generation');
       setStatus(`Connected to ${result.serverName}. ${result.tools.length} tool(s) listed.`);
     }
   }
@@ -309,7 +446,8 @@ export function McpPanel() {
     );
     if (result) {
       setTools(result);
-      if (result.length > 0) setSelectedTool(result[0].name);
+      if (result.length > 0) selectTool(result[0].name, result);
+      if (result.some(t => t.name === 'get_generation')) setStatusTool('get_generation');
       setStatus(`${result.length} tool(s) listed.`);
     }
   }
@@ -323,14 +461,21 @@ export function McpPanel() {
       setError(String(e));
       return;
     }
-    const result = await task(() =>
-      invoke<ToolResult>('mcp_call_tool', {
+    const result = await task(async () => {
+      if (selectedToolDef) {
+        await invoke('mcp_validate_tool_arguments', {
+          tool: selectedTool,
+          schema: selectedToolDef.inputSchema ?? {},
+          arguments: args,
+        });
+      }
+      return invoke<ToolResult>('mcp_call_tool', {
         server: toServerConfig(selectedServer),
         tool: selectedTool,
         arguments: args,
         apiKey: null,
-      }),
-    );
+      });
+    });
     if (result) {
       setToolResult(result);
       setStatus(result.isError ? 'The tool reported an error — see the result.' : 'Tool call completed.');
@@ -465,6 +610,116 @@ export function McpPanel() {
     });
   }
 
+  async function discoverOAuth() {
+    const discovery = await task(() => invoke<OAuthDiscovery>('mcp_oauth_discover_higgsfield'));
+    if (discovery) {
+      setOauthDiscovery(discovery);
+      setStatus('Higgsfield OAuth endpoints discovered. No account or credential was used.');
+    }
+  }
+
+  async function registerOAuthClient() {
+    if (!oauthRedirectUri.trim()) {
+      setError('Enter a redirect URI.');
+      return;
+    }
+    const registration = await task(() =>
+      invoke<OAuthClientRegistration>('mcp_oauth_register_client', { redirectUri: oauthRedirectUri.trim() }),
+    );
+    if (registration) {
+      setOauthClient(registration);
+      setStatus(
+        registration.clientSecret
+          ? 'Client registered. The client secret is kept in memory for this session only and is not shown.'
+          : 'Client registered as a public client (no client secret was issued).',
+      );
+    }
+  }
+
+  async function buildOAuthUrl() {
+    if (!oauthDiscovery || !oauthClient) return;
+    const pair = await task(() => invoke<PkcePair>('mcp_oauth_pkce_pair'));
+    if (!pair) return;
+    oauthPkceRef.current = pair;
+    const url = await task(() =>
+      invoke<string>('mcp_oauth_authorization_url', {
+        authorizationEndpoint: oauthDiscovery.authorizationEndpoint,
+        clientId: oauthClient.clientId,
+        redirectUri: oauthRedirectUri.trim(),
+        codeChallenge: pair.challenge,
+        state: crypto.randomUUID(),
+      }),
+    );
+    if (url) {
+      setOauthUrl(url);
+      setStatus('Sign-in URL built. Paste it into a browser and sign in with the Higgsfield account.');
+    }
+  }
+
+  async function copyOAuthUrl() {
+    if (!oauthUrl) return;
+    try {
+      await navigator.clipboard.writeText(oauthUrl);
+      setStatus('Sign-in URL copied.');
+    } catch {
+      setStatus('Copy did not work in this browser — select the sign-in URL and copy it by hand.');
+    }
+  }
+
+  async function exchangeOAuthCode() {
+    if (!oauthDiscovery || !oauthClient) return;
+    if (!selectedServer) {
+      setError('Add and select the Higgsfield (hosted MCP) server above first — the token is stored under that server.');
+      return;
+    }
+    if (!oauthCode.trim()) {
+      setError('Paste the authorization code from the browser address bar.');
+      return;
+    }
+    if (!oauthPkceRef.current) {
+      setError('Build the sign-in URL first — the PKCE verifier from that step is required to exchange the code.');
+      return;
+    }
+    const summary = await task(() =>
+      invoke<OAuthTokenSummary>('mcp_oauth_exchange_code', {
+        tokenEndpoint: oauthDiscovery.tokenEndpoint,
+        serverId: selectedServer.id,
+        clientId: oauthClient.clientId,
+        clientSecret: oauthClient.clientSecret ?? null,
+        code: oauthCode.trim(),
+        redirectUri: oauthRedirectUri.trim(),
+        codeVerifier: oauthPkceRef.current?.verifier ?? '',
+        storage,
+      }),
+    );
+    if (summary) {
+      setOauthToken(summary);
+      setOauthCode('');
+      setStatus('Higgsfield access token stored. Test the connection above to list the hosted tools.');
+    }
+  }
+
+  async function refreshOAuthToken() {
+    if (!oauthDiscovery || !oauthClient) return;
+    if (!selectedServer) {
+      setError('Add and select the Higgsfield (hosted MCP) server above first — the token is stored under that server.');
+      return;
+    }
+    const summary = await task(() =>
+      invoke<OAuthTokenSummary>('mcp_oauth_refresh_token', {
+        tokenEndpoint: oauthDiscovery.tokenEndpoint,
+        serverId: selectedServer.id,
+        clientId: oauthClient.clientId,
+        clientSecret: oauthClient.clientSecret ?? null,
+        storage,
+      }),
+    );
+    if (summary) {
+      setOauthToken(summary);
+      setStatus('Higgsfield access token refreshed and stored.');
+    }
+  }
+
   async function downloadAndImport(media: MediaCandidate) {
     if (!project) {
       setError('Create or open a project first — imports go into the media bin.');
@@ -484,9 +739,103 @@ export function McpPanel() {
     }
   }
 
-  const formBlocked = presetId === 'higgsfield-rest' || presetId === 'higgsfield-mcp';
+  function formFieldInput(field: FormField) {
+    const value = paramValue(field.name);
+    const label = field.title ?? field.name;
+    const suffix = field.required ? ' (required)' : '';
+    const hint = field.description ?? '';
+    if (field.enumValues.length > 0) {
+      return <label key={field.name}>{label}{suffix}
+        <select
+          value={typeof value === 'string' || typeof value === 'number' ? String(value) : ''}
+          disabled={working}
+          onChange={e => {
+            const next = e.target.value;
+            if (next === '') {
+              setParam(field.name, undefined);
+              return;
+            }
+            const match = field.enumValues.find(v => String(v) === next);
+            setParam(field.name, match === undefined ? next : match);
+          }}
+        >
+          {!field.required && <option value="">—</option>}
+          {field.enumValues.map(v => <option key={String(v)} value={String(v)}>{String(v)}</option>)}
+        </select>
+        {hint && <span>{hint}</span>}
+      </label>;
+    }
+    if (field.fieldType === 'boolean') {
+      return <label key={field.name}>{label}{suffix}
+        <input type="checkbox" checked={value === true} disabled={working} onChange={e => setParam(field.name, e.target.checked)} />
+        {hint && <span>{hint}</span>}
+      </label>;
+    }
+    if (field.fieldType === 'integer' || field.fieldType === 'number') {
+      return <label key={field.name}>{label}{suffix}
+        <input
+          type="number"
+          value={typeof value === 'number' ? value : ''}
+          min={field.minimum ?? undefined}
+          max={field.maximum ?? undefined}
+          step={field.fieldType === 'integer' ? 1 : 'any'}
+          disabled={working}
+          onChange={e => {
+            const next = e.target.value === '' ? Number.NaN : Number(e.target.value);
+            setParam(field.name, Number.isNaN(next) ? undefined : next);
+          }}
+        />
+        {hint && <span>{hint}</span>}
+      </label>;
+    }
+    if (field.fieldType === 'array') {
+      return <label key={field.name}>{label}{suffix}
+        <textarea
+          rows={3}
+          value={Array.isArray(value) ? (value as unknown[]).join('\n') : ''}
+          disabled={working}
+          spellCheck={false}
+          placeholder="One value per line"
+          onChange={e => {
+            const lines = e.target.value.split('\n').map(l => l.trim()).filter(l => l !== '');
+            setParam(field.name, lines.length > 0 ? lines : undefined);
+          }}
+        />
+        {hint && <span>{hint}</span>}
+      </label>;
+    }
+    if (field.fieldType === 'object') {
+      return <p key={field.name}>{label}{suffix} — edit this object in Advanced parameters (JSON) below.{hint ? ` ${hint}` : ''}</p>;
+    }
+    if (field.name === 'prompt' || (field.maxLength !== null && field.maxLength !== undefined && field.maxLength > 200)) {
+      return <label key={field.name}>{label}{suffix}
+        <textarea
+          rows={3}
+          value={typeof value === 'string' ? value : ''}
+          maxLength={field.maxLength ?? undefined}
+          disabled={working}
+          spellCheck={false}
+          onChange={e => setParam(field.name, e.target.value === '' && !field.required ? undefined : e.target.value)}
+        />
+        {hint && <span>{hint}</span>}
+      </label>;
+    }
+    return <label key={field.name}>{label}{suffix}
+      <input
+        type="text"
+        value={typeof value === 'string' ? value : ''}
+        maxLength={field.maxLength ?? undefined}
+        disabled={working}
+        spellCheck={false}
+        onChange={e => setParam(field.name, e.target.value === '' && !field.required ? undefined : e.target.value)}
+      />
+      {hint && <span>{hint}</span>}
+    </label>;
+  }
+
+  const formBlocked = presetId === 'higgsfield-rest';
   const presetNote = selectedPreset && !selectedPreset.available
-    ? 'OAuth sign-in is not implemented in this release, so this preset cannot connect yet. Use the Higgsfield REST API section below instead.'
+    ? 'OAuth sign-in is implemented but untested end to end. Add the server, complete the OAuth steps in the Higgsfield (hosted MCP) section below, then test the connection.'
     : selectedPreset?.id === 'higgsfield-rest'
       ? 'The Higgsfield REST API does not use an MCP server entry. Use the Higgsfield section below.'
       : null;
@@ -535,8 +884,20 @@ export function McpPanel() {
         {testResult && <div><p>Protocol: {testResult.protocolVersion ?? 'not reported'}</p>{testResult.tools.length > 0 ? <ul>{testResult.tools.map(t => <li key={t.name}><strong>{t.name}</strong>{t.description ? ` — ${t.description}` : ''}</li>)}</ul> : <p>No tools listed.</p>}</div>}
       </div>}
       {selectedServer && tools.length > 0 && <div><h3>3. Run a tool</h3>
-        <label>Tool<select value={selectedTool} disabled={working} onChange={e => setSelectedTool(e.target.value)}>{tools.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}</select></label>
-        <label>Parameters (JSON)<textarea rows={6} value={paramsText} onChange={e => setParamsText(e.target.value)} spellCheck={false} /></label>
+        <label>Tool<select value={selectedTool} disabled={working} onChange={e => selectTool(e.target.value)}>{tools.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}</select></label>
+        {selectedToolDef?.description && <p>{selectedToolDef.description}</p>}
+        {formFields.length > 0
+          ? <div>
+              <p>Fields are built from the server's live tool schema (tools/list). The values are assembled into the JSON below before the call.</p>
+              {selectedServer.presetId === 'hyperframes' && <p className="director-notice">The first live generate_video call with these fields has not been tested in this environment.</p>}
+              {formFields.map(f => formFieldInput(f))}
+            </div>
+          : <p className="director-notice">The server reported no parameter schema for this tool — use the JSON editor below.</p>}
+        <details>
+          <summary>Advanced parameters (JSON)</summary>
+          <label>Parameters (JSON)<textarea rows={6} value={paramsText} onChange={e => setParamsText(e.target.value)} spellCheck={false} /></label>
+          <p>The form above and this editor change the same parameters. Arguments are validated against the tool schema before the call is sent.</p>
+        </details>
         <div className="director-actions"><button className="button primary" disabled={!native || working || !selectedTool} onClick={() => void runTool()}>Run tool</button></div>
         {toolResult && <div>
           <p>{toolResult.isError ? 'The tool reported an error.' : 'Tool call completed.'}</p>
@@ -590,11 +951,44 @@ export function McpPanel() {
           </div>}
         </div>}
       </div>
+      <div><h3>Higgsfield (hosted MCP, OAuth)</h3>
+        <p>Sign in with a Higgsfield account through the hosted MCP server's OAuth flow. This flow is implemented but untested end to end: no sign-in has been completed from this app, and the redirect receiver is not implemented yet.</p>
+        <p>Steps: discover the endpoints, register this app, open the sign-in URL in a browser, then paste the authorization code back here. Tokens are stored with the credential storage selected above, under the selected server.</p>
+        <label>Redirect URI<input value={oauthRedirectUri} onChange={e => setOauthRedirectUri(e.target.value)} spellCheck={false} disabled={!native || working} maxLength={2048} /></label>
+        <p>Nothing listens on this address yet. After sign-in the browser shows a connection error — the authorization code is still in the address bar. Copy the code value from the address bar and paste it below.</p>
+        <div className="director-actions">
+          <button className="button secondary" disabled={!native || working} onClick={() => void discoverOAuth()}>1. Discover endpoints</button>
+          <button className="button secondary" disabled={!native || working || !oauthDiscovery} onClick={() => void registerOAuthClient()}>2. Register this app</button>
+          <button className="button secondary" disabled={!native || working || !oauthDiscovery || !oauthClient} onClick={() => void buildOAuthUrl()}>3. Build sign-in URL</button>
+        </div>
+        {oauthDiscovery && <div>
+          <p>Authorization endpoint: {oauthDiscovery.authorizationEndpoint}</p>
+          <p>Token endpoint: {oauthDiscovery.tokenEndpoint}</p>
+          <p>Registration endpoint: {oauthDiscovery.registrationEndpoint ?? 'not published'}</p>
+          <p>Scopes: {oauthDiscovery.scopesSupported.join(', ') || 'not listed'}</p>
+          <p>PKCE methods: {oauthDiscovery.codeChallengeMethodsSupported.join(', ') || 'not listed'}</p>
+          <p>Authorization servers: {oauthDiscovery.authorizationServers.join(', ') || 'not listed'}</p>
+          {oauthDiscovery.clientIdMetadataDocumentSupported && <p>Note: the server reports support for client ID metadata documents. Whether dynamic client registration remains accepted is unverified.</p>}
+        </div>}
+        {oauthClient && <p>Client id: {oauthClient.clientId}{oauthClient.clientSecret ? ' — a client secret was issued and is kept in memory for this session only.' : ' — no client secret was issued.'}</p>}
+        {oauthUrl && <div>
+          <label>Sign-in URL<input value={oauthUrl} readOnly spellCheck={false} /></label>
+          <div className="director-actions"><button className="button secondary" disabled={!native || working} onClick={() => void copyOAuthUrl()}>Copy sign-in URL</button></div>
+          <p>Paste this URL into a browser, sign in with the Higgsfield account, and copy the code from the address bar.</p>
+          <label>Authorization code<input value={oauthCode} onChange={e => setOauthCode(e.target.value)} spellCheck={false} disabled={!native || working} maxLength={2048} placeholder="Paste the code from the browser address bar" /></label>
+          <div className="director-actions">
+            <button className="button primary" disabled={!native || working || !selectedServer || !oauthCode.trim()} onClick={() => void exchangeOAuthCode()}>4. Exchange code for token</button>
+            <button className="button secondary" disabled={!native || working || !selectedServer || !oauthDiscovery || !oauthClient} onClick={() => void refreshOAuthToken()}>Refresh token</button>
+          </div>
+          {!selectedServer && <p>Select a Higgsfield (hosted MCP) server above first — the token is stored under that server.</p>}
+        </div>}
+        {oauthToken && <p>Token stored: {oauthToken.tokenType}{oauthToken.expiresIn ? `, valid for ${oauthToken.expiresIn} seconds` : ''}{oauthToken.hasRefreshToken ? ', with a refresh token.' : ', without a refresh token.'}</p>}
+      </div>
     </div><aside className="director-review" aria-label="MCP notes"><h3>Notes</h3>
       <p className="director-badge">KEYS STAY IN THE OS STORE OR SESSION MEMORY</p>
       <p>Credentials are never written to project files or preferences. Downloads are saved under the app data directory and imported through the existing media import, so thumbnails, waveforms, and the media index are built the same way as any other import.</p>
       <p>HyperFrames video generation is asynchronous: run generate_video, copy the task id into the status arguments, and poll get_generation until the media URL appears.</p>
-      <p>The hosted Higgsfield MCP server needs browser OAuth, which is not implemented in this release. Its REST API preset above is the working Higgsfield path.</p>
+      <p>The hosted Higgsfield MCP server signs in with browser OAuth. The authorization-code flow with PKCE is implemented in the section above but untested end to end; the REST API preset is the tested Higgsfield path.</p>
       {status && <p role="status">{status}</p>}
       {error && <p role="alert" className="error">{error}</p>}
     </aside></div>}

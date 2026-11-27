@@ -20,11 +20,15 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 use studiocut_ai::mcp::{
-    builtin_presets, collect_media_urls, higgsfield_models, job_state_from_status,
-    job_state_from_status_with_media, parse_higgsfield_key, parse_response, parse_streamable_body,
-    preset_by_id, scan_text_for_media_urls, validate_api_key, validate_download_file_name,
-    validate_higgsfield_endpoint, validate_remote_url, validate_server_id, validate_stdio_command,
-    AuthKind, JobPoll, JobState, McpCredentials, PresetKind, ServerConfig, TransportKind,
+    build_oauth_authorization_url, build_refresh_token_body, build_token_exchange_body,
+    builtin_presets, collect_media_urls, form_fields_from_schema, generate_pkce_pair,
+    higgsfield_models, job_state_from_status, job_state_from_status_with_media,
+    parse_higgsfield_key, parse_response, parse_streamable_body, percent_encode_form_value,
+    pkce_challenge, preset_by_id, scan_text_for_media_urls, validate_api_key,
+    validate_arguments_against_schema, validate_download_file_name, validate_higgsfield_endpoint,
+    validate_hyperframes_arguments, validate_oauth_redirect_uri, validate_remote_url,
+    validate_server_id, validate_stdio_command, AuthKind, JobPoll, JobState, McpCredentials,
+    PresetKind, ServerConfig, TransportKind,
 };
 
 fn http_server(id: &str, url: &str) -> ServerConfig {
@@ -170,7 +174,7 @@ fn presets_cover_both_higgsfield_paths_hyperframes_and_custom() {
     assert_eq!(mcp.kind, PresetKind::McpHttp);
     assert_eq!(mcp.auth, AuthKind::Oauth);
     assert!(!mcp.available);
-    assert!(mcp.notes.join(" ").contains("not implemented"));
+    assert!(mcp.notes.join(" ").contains("untested end to end"));
     let hyperframes = preset_by_id("hyperframes").unwrap();
     assert_eq!(hyperframes.kind, PresetKind::McpHttp);
     assert_eq!(hyperframes.auth, AuthKind::ApiKey);
@@ -326,4 +330,144 @@ fn session_credentials_are_scoped_per_server() {
     // Deleting a server with no stored credential is not an error when
     // the OS store has no entry either; the session entry is gone.
     assert!(store.delete("never-saved").is_ok());
+}
+
+#[test]
+fn tool_schema_drives_form_fields_and_validation() {
+    // The shape of a tools/list inputSchema, with the parameter names
+    // documented on hyperframes.net/hyperframes-mcp (6 November 2026).
+    // The names come from that page; the test proves the conversion
+    // and validation, not a live server response, which has not been
+    // fetched in this environment.
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "Text prompt", "maxLength": 4000},
+            "image_url": {"type": "string"},
+            "video_urls": {"type": "array", "items": {"type": "string"}},
+            "scene": {"type": "string"},
+            "duration_seconds": {"type": "integer", "minimum": 4, "maximum": 15, "default": 15},
+            "resolution": {"type": "string", "enum": ["480p", "720p"], "default": "720p"},
+            "fast": {"type": "boolean", "default": true},
+            "aspect_ratio": {"type": "string"},
+            "generate_audio": {"type": "boolean"},
+            "web_search": {"type": "boolean"},
+            "seed": {"type": "integer"}
+        },
+        "required": ["prompt"]
+    });
+    let fields = form_fields_from_schema(&schema);
+    assert_eq!(fields.len(), 11);
+    let prompt = fields.iter().find(|f| f.name == "prompt").unwrap();
+    assert_eq!(prompt.field_type, "string");
+    assert!(prompt.required);
+    assert_eq!(prompt.max_length, Some(4000));
+    let duration = fields
+        .iter()
+        .find(|f| f.name == "duration_seconds")
+        .unwrap();
+    assert_eq!(duration.field_type, "integer");
+    assert_eq!(duration.minimum, Some(4.0));
+    assert_eq!(duration.maximum, Some(15.0));
+    assert_eq!(duration.default, Some(json!(15)));
+    let resolution = fields.iter().find(|f| f.name == "resolution").unwrap();
+    assert_eq!(resolution.enum_values, vec![json!("480p"), json!("720p")]);
+    let clips = fields.iter().find(|f| f.name == "video_urls").unwrap();
+    assert_eq!(clips.field_type, "array");
+    assert_eq!(clips.items_type.as_deref(), Some("string"));
+    // Schema validation accepts a complete call and rejects the
+    // usual mistakes.
+    let valid = json!({
+        "prompt": "A calm studio shot",
+        "duration_seconds": 4,
+        "resolution": "720p",
+        "fast": true,
+        "video_urls": ["https://example.com/ref.mp4"]
+    });
+    assert!(validate_arguments_against_schema(&schema, &valid).is_ok());
+    assert!(validate_arguments_against_schema(&schema, &json!({})).is_err());
+    assert!(validate_arguments_against_schema(
+        &schema,
+        &json!({"prompt": "x", "duration_seconds": 16})
+    )
+    .is_err());
+    assert!(validate_arguments_against_schema(
+        &schema,
+        &json!({"prompt": "x", "resolution": "1080p"})
+    )
+    .is_err());
+    // The documented HyperFrames limits agree with the schema.
+    assert!(validate_hyperframes_arguments("generate_video", &valid).is_ok());
+    assert!(
+        validate_hyperframes_arguments("generate_video", &json!({"prompt": "x".repeat(4001)}))
+            .is_err()
+    );
+    assert!(validate_hyperframes_arguments(
+        "generate_video",
+        &json!({"prompt": "x", "duration_seconds": 3})
+    )
+    .is_err());
+    assert!(validate_hyperframes_arguments(
+        "generate_image",
+        &json!({"prompt": "A still", "resolution": "2K"})
+    )
+    .is_ok());
+    assert!(validate_hyperframes_arguments(
+        "generate_image",
+        &json!({"prompt": "A still", "resolution": "720p"})
+    )
+    .is_err());
+}
+
+#[test]
+fn oauth_url_pkce_and_token_bodies_are_well_formed() {
+    // RFC 7636 appendix B test vector.
+    assert_eq!(
+        pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    );
+    let pair = generate_pkce_pair();
+    assert_eq!(pair.verifier.len(), 64);
+    assert_eq!(pair.challenge, pkce_challenge(&pair.verifier));
+    let url = build_oauth_authorization_url(
+        "https://mcp.higgsfield.ai/oauth2/authorize",
+        "client-123",
+        "http://127.0.0.1:49152/callback",
+        &pair.challenge,
+        "state-xyz",
+    )
+    .unwrap();
+    assert!(url.starts_with("https://mcp.higgsfield.ai/oauth2/authorize?"));
+    assert!(url.contains("response_type=code"));
+    assert!(url.contains("client_id=client-123"));
+    assert!(url.contains("code_challenge_method=S256"));
+    assert!(url.contains("scope=openid+email+offline_access"));
+    assert!(url.contains("resource=https%3A%2F%2Fmcp.higgsfield.ai%2Fmcp"));
+    assert!(url.contains(&format!("code_challenge={}", pair.challenge)));
+    assert!(build_oauth_authorization_url(
+        "https://mcp.higgsfield.ai/oauth2/authorize",
+        "client-123",
+        "http://example.com/callback",
+        &pair.challenge,
+        "state-xyz",
+    )
+    .is_err());
+    assert_eq!(percent_encode_form_value("a b&c=d"), "a+b%26c%3Dd");
+    let exchange = build_token_exchange_body(
+        "client-1",
+        "SplxlOBeZQQ",
+        "http://127.0.0.1:49152/callback",
+        &"v".repeat(43),
+        None,
+    );
+    assert!(exchange.contains("grant_type=authorization_code"));
+    assert!(exchange.contains("code=SplxlOBeZQQ"));
+    assert!(!exchange.contains("client_secret"));
+    let refresh = build_refresh_token_body("client-1", "refresh-token-1", Some("s3cret"));
+    assert!(refresh.contains("grant_type=refresh_token"));
+    assert!(refresh.contains("client_secret=s3cret"));
+    assert!(validate_oauth_redirect_uri("http://127.0.0.1:49152/callback").is_ok());
+    assert!(validate_oauth_redirect_uri("https://example.com/oauth/callback").is_ok());
+    assert!(validate_oauth_redirect_uri("http://example.com/callback").is_err());
+    assert!(validate_oauth_redirect_uri("myapp:/callback").is_err());
 }

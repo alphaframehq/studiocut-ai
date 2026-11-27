@@ -59,6 +59,22 @@ export function setEncoderPreference(encoder: string): void {
   );
 }
 
+// --- Export proxy choice ---------------------------------------------------
+// Whether exports render from ready 540p proxy files when available.
+// Defaults off: an export never silently uses low-resolution proxies.
+// Persisted like the encoder preference; the Export dialog reads it
+// when it opens and writes it when the checkbox changes.
+const EXPORT_PROXY_KEY = 'studiocut.exportUseProxy';
+export const DEFAULT_EXPORT_USE_PROXY = false;
+
+export function getExportUseProxy(): boolean {
+  return read(EXPORT_PROXY_KEY) === '1';
+}
+
+export function setExportUseProxy(useProxy: boolean): void {
+  write(EXPORT_PROXY_KEY, useProxy ? '1' : '0');
+}
+
 export function getWhisperBinary(): string {
   return read(WHISPER_BINARY_KEY) ?? DEFAULT_WHISPER_BINARY;
 }
