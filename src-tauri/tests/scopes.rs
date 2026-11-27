@@ -5,7 +5,7 @@
 
 use std::{fs, path::Path, process::Command};
 use studiocut_ai::{
-    media::import_media,
+    media::{ffmpeg_path, import_media},
     scopes::{analyze_scopes, shape_scopes, VECTORSCOPE_CELLS, WAVEFORM_COLUMNS},
     timeline::{Clip, Track},
     Project, Settings,
@@ -13,7 +13,7 @@ use studiocut_ai::{
 use uuid::Uuid;
 
 fn fixture(path: &Path) {
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
