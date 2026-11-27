@@ -17,7 +17,6 @@ export type Edit =
   | { type: 'remove'; clipId: string }
   | { type: 'toggle'; trackId: string; flag: 'muted' | 'solo' | 'locked' };
 export const HISTORY_LIMIT = 50;
-export const MAX_FRAMES = 21600 * 60;
 export function newId() {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   bytes[6] = (bytes[6] & 15) | 64;

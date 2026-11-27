@@ -41,7 +41,7 @@ function write(key: string, value: string): void {
   try {
     localStorage.setItem(key, value);
   } catch {
-    // Storage unavailable (private mode, etc.) — preferences just don't persist.
+    // Storage unavailable (private mode, etc.) — preferences do not persist.
   }
 }
 

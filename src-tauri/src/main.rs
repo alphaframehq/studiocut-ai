@@ -996,7 +996,6 @@ fn export_start(
     output: String,
     settings: studiocut_ai::filtergraph::ExportSettings,
 ) -> Result<studiocut_ai::render::Snapshot, String> {
-    use tauri::Manager;
     license_gate(&app)?;
     let project = state
         .0
