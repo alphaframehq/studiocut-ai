@@ -553,3 +553,112 @@ export function addRecentProject(path: string, name: string): RecentProject[] {
   write(RECENT_KEY, JSON.stringify(next));
   return next;
 }
+
+// --- MCP servers (Phase 5) ------------------------------------------------
+// Saved MCP server configurations (remote URL or local stdio command).
+// No secrets live here — API keys stay in the OS keyring / session vault
+// managed by the Rust MCP module (see mcp_set_credential). At most 20
+// servers are kept.
+export type McpServerConfig = {
+  id: string;
+  name: string;
+  presetId: string | null;
+  transport: 'http' | 'stdio';
+  url: string;
+  command: string;
+};
+
+const MCP_SERVERS_KEY = 'studiocut.mcpServers';
+const MCP_SELECTED_SERVER_KEY = 'studiocut.mcpSelectedServer';
+const MCP_SERVERS_MAX = 20;
+
+function validMcpServer(value: unknown): McpServerConfig | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const server = value as Record<string, unknown>;
+  if (
+    typeof server.id !== 'string' ||
+    !server.id ||
+    server.id.length > 80 ||
+    /\s/.test(server.id) ||
+    typeof server.name !== 'string' ||
+    !server.name.trim() ||
+    server.name.length > 120 ||
+    (server.presetId !== null && typeof server.presetId !== 'string') ||
+    (server.transport !== 'http' && server.transport !== 'stdio') ||
+    typeof server.url !== 'string' ||
+    server.url.length > 2048 ||
+    typeof server.command !== 'string' ||
+    server.command.length > 4096
+  ) {
+    return null;
+  }
+  return {
+    id: server.id,
+    name: server.name,
+    presetId: server.presetId as string | null,
+    transport: server.transport as 'http' | 'stdio',
+    url: server.url,
+    command: server.command,
+  };
+}
+
+export function getMcpServers(): McpServerConfig[] {
+  const raw = read(MCP_SERVERS_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown[];
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    return parsed
+      .map(validMcpServer)
+      .filter((s): s is McpServerConfig => {
+        if (!s || seen.has(s.id)) return false;
+        seen.add(s.id);
+        return true;
+      })
+      .slice(0, MCP_SERVERS_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function saveMcpServers(servers: McpServerConfig[]): McpServerConfig[] {
+  const next = servers.slice(0, MCP_SERVERS_MAX);
+  write(MCP_SERVERS_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function addMcpServer(server: McpServerConfig): McpServerConfig[] {
+  const valid = validMcpServer(server);
+  if (!valid) return getMcpServers();
+  return saveMcpServers([
+    valid,
+    ...getMcpServers().filter(s => s.id !== valid.id),
+  ]);
+}
+
+export function updateMcpServer(server: McpServerConfig): McpServerConfig[] {
+  const valid = validMcpServer(server);
+  if (!valid) return getMcpServers();
+  return saveMcpServers(getMcpServers().map(s => (s.id === valid.id ? valid : s)));
+}
+
+export function removeMcpServer(id: string): McpServerConfig[] {
+  return saveMcpServers(getMcpServers().filter(s => s.id !== id));
+}
+
+export function getMcpSelectedServer(): string | null {
+  return read(MCP_SELECTED_SERVER_KEY);
+}
+
+export function setMcpSelectedServer(id: string | null): void {
+  if (id) {
+    write(MCP_SELECTED_SERVER_KEY, id);
+  } else {
+    try {
+      localStorage.removeItem(MCP_SELECTED_SERVER_KEY);
+    } catch {
+      // Storage unavailable — nothing to clear.
+    }
+  }
+}

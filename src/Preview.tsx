@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useProject } from './store';
 import { audible, timelineEnd } from './timeline';
 import { mediaUrl, TimelinePlayer } from './playback';
 import { zoomAt } from './effects';
 import { EffectPreview } from './EffectPreview';
+import { PROXY_TOGGLED_EVENT, isProxyPreferred } from './ProxyToggle';
 
 export function Preview() {
   const { project, playing, frame } = useProject();
@@ -12,10 +14,16 @@ export function Preview() {
   const [url, setUrl] = useState('');
   const [sourceError, setSourceError] = useState('');
   const [attachmentVersion, setAttachmentVersion] = useState(0);
+  const [proxyVersion, setProxyVersion] = useState(0);
   useEffect(() => {
     const refresh = () => setAttachmentVersion(v => v + 1);
     window.addEventListener('studiocut-media-attached', refresh);
     return () => window.removeEventListener('studiocut-media-attached', refresh);
+  }, []);
+  useEffect(() => {
+    const refresh = () => setProxyVersion(v => v + 1);
+    window.addEventListener(PROXY_TOGGLED_EVENT, refresh);
+    return () => window.removeEventListener(PROXY_TOGGLED_EVENT, refresh);
   }, []);
   const active = project?.tracks.filter(t => t.kind === 'video' && audible(t, project.tracks)).flatMap(t => t.clips.filter(c => c.start <= frame && c.start + c.duration > frame))[0];
   const asset = project?.assets.find(a => a.id === active?.assetId);
@@ -32,9 +40,23 @@ export function Preview() {
   useEffect(() => {
     let cancelled = false;
     setUrl(''); setSourceError('');
-    if (asset) void mediaUrl(asset).then(url => { if (!cancelled) setUrl(url); }).catch(error => { if (!cancelled) { setSourceError(String(error)); useProject.setState({ playing: false }); } });
+    if (asset) {
+      // When the user prefers the proxy for this asset, try it first and
+      // fall back to the original media on any error. Export always uses
+      // the original.
+      const load = async () => {
+        if (isProxyPreferred(asset.id)) {
+          try {
+            const proxyUrl = await invoke<string>('proxy_playback_source', { id: asset.id });
+            if (!cancelled) { setUrl(proxyUrl); return; }
+          } catch { /* fall through to the original media */ }
+        }
+        void mediaUrl(asset).then(url => { if (!cancelled) setUrl(url); }).catch(error => { if (!cancelled) { setSourceError(String(error)); useProject.setState({ playing: false }); } });
+      };
+      void load();
+    }
     return () => { cancelled = true; };
-  }, [asset, active?.id, attachmentVersion]);
+  }, [asset, active?.id, attachmentVersion, proxyVersion]);
   useEffect(() => {
     if (!project || !playing || !timelineEnd(project.tracks)) return;
     const player = new TimelinePlayer(project,

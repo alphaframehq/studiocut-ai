@@ -11,6 +11,9 @@ const defaultModelFor = (provider: string) => provider === 'groq' ? 'whisper-lar
 
 type Result = { projectId: string; revision: number; clipId: string; cuts?: Cut[]; transcript?: Transcript };
 type CutResult = { projectId: string; revision: number; cuts: Cut[] };
+type DiarizationResult = { method: string; turns: { speaker: string; start: number; end: number; wordCount: number }[]; note: string };
+type BeatResult = { method: string; bpm: number | null; confidence: number; beats: number[]; note: string };
+type ReframePlan = { method: string; target: string; sourceWidth: number; sourceHeight: number; crop: { x: number; y: number; width: number; height: number }; ffmpegFilter: string; note: string };
 export function AnalysisPanel() {
   const { project, selected, busy, applyAnalysis, seek } = useProject();
   const [threshold, setThreshold] = useState(-38);
@@ -45,7 +48,13 @@ export function AnalysisPanel() {
   const [energyNote, setEnergyNote] = useState('');
   const [roughResult, setRoughResult] = useState<(RoughCut & { projectId: string; revision: number }) | null>(null);
   const [roughEnabled, setRoughEnabled] = useState<number[]>([]);
-  useEffect(() => { setResult(null); setEnabled([]); setConsent(false); setScenes(null); setFillerResult(null); setFillerEnabled([]); setLowEnergy(null); setEnergyNote(''); setRoughResult(null); setRoughEnabled([]); }, [project?.id, project?.revision, selected]);
+  // Phase 5 §07: speaker turns (heuristic), beats (heuristic), reframe (centre crop).
+  const [speakers, setSpeakers] = useState<DiarizationResult | null>(null);
+  const [beats, setBeats] = useState<BeatResult | null>(null);
+  const [reframe, setReframe] = useState<ReframePlan | null>(null);
+  const [reframeTarget, setReframeTarget] = useState('9:16');
+  const [gapNote, setGapNote] = useState('');
+  useEffect(() => { setResult(null); setEnabled([]); setConsent(false); setScenes(null); setFillerResult(null); setFillerEnabled([]); setLowEnergy(null); setEnergyNote(''); setRoughResult(null); setRoughEnabled([]); setSpeakers(null); setBeats(null); setReframe(null); setGapNote(''); }, [project?.id, project?.revision, selected]);
   // Fetch (or load from the 1h cache) the transcription-model list for a
   // provider. Local scans the folder next to the configured .bin file.
   async function refreshModels(p: string, keyValue: string, endpointValue: string, localModelValue: string, bypassCache: boolean) {
@@ -87,6 +96,13 @@ export function AnalysisPanel() {
   }
   // Scan the local model folder once on mount (desktop only).
   useEffect(() => { if (native) void refreshModels('local', '', '', getWhisperModel(), false); }, []);
+  // Phase 5: report honestly what the AI-gap methods can and cannot do.
+  useEffect(() => {
+    if (!native) return;
+    void Promise.all([invoke<{ method: string; note: string }>('diarization_capability'), invoke<{ method: string; note: string }>('reframe_capability')])
+      .then(([d, r]) => setGapNote(`Speakers: ${d.method} — ${d.note} Reframe: ${r.method} — ${r.note}`))
+      .catch(error => setGapNote(String(error)));
+  }, []);
   const effectiveModel = provider === 'local' ? localModel : modelMode === 'custom' ? customModel : model;
   const clip = project?.tracks.filter(t => t.kind !== 'caption').flatMap(t => t.clips).find(c => c.id === selected);
   const asset = project?.assets.find(a => a.id === clip?.assetId);
@@ -162,6 +178,29 @@ export function AnalysisPanel() {
     } catch (error) { setFailure(String(error)); setStatus(''); }
     finally { useProject.setState({ busy: false }); }
   }
+  async function runGap(kind: 'speakers' | 'beats' | 'reframe') {
+    if (!native || !project || busy) return;
+    setFailure('');
+    useProject.setState({ busy: true, playing: false });
+    const snapshot = { projectId: project.id, revision: project.revision, clipId: selected };
+    try {
+      if (kind === 'speakers') {
+        if (!current || !result!.transcript) throw new Error('Transcribe the clip first, then detect speaker turns.');
+        const found = await invoke<DiarizationResult>('detect_speakers', { ...snapshot, words: result!.transcript.items, minPauseSecs: 0.8 });
+        setSpeakers(found);
+        setStatus(`${found.turns.length} speaker turn${found.turns.length === 1 ? '' : 's'} detected (${found.method} — pause-based hints, not model output).`);
+      } else if (kind === 'beats') {
+        const found = await invoke<BeatResult>('detect_beats', { ...snapshot });
+        setBeats(found);
+        setStatus(found.bpm === null ? 'No stable pulse found — no tempo invented.' : `${found.bpm.toFixed(1)} BPM · ${found.beats.length} beats · confidence ${(found.confidence * 100).toFixed(0)}% (${found.method}).`);
+      } else {
+        const plan = await invoke<ReframePlan>('reframe_clip', { ...snapshot, target: reframeTarget, focusX: null, focusY: null });
+        setReframe(plan);
+        setStatus(`Centre-crop plan for ${plan.target}: ${plan.crop.width}×${plan.crop.height} at ${plan.crop.x},${plan.crop.y} — no face detected.`);
+      }
+    } catch (error) { setFailure(String(error)); setStatus(''); }
+    finally { useProject.setState({ busy: false }); }
+  }
   return <section className="analysis-panel" aria-label="Silence and captions">
     <div className="analysis-title"><h2>Silence & captions</h2><span>{asset ? `Selected: ${asset.name}` : 'Select an audio or video clip on the timeline'}</span></div>
     {!native && <p className="analysis-notice">Analysis unavailable in browser preview. Use the desktop app for Rust DSP, whisper-cli, and secure BYOK transcription. Saved caption clips still play here.</p>}
@@ -203,6 +242,17 @@ export function AnalysisPanel() {
       <p>Hook-first: combines the silence, filler and low-energy cuts you already ran — scene scores only pick the hook. It does not re-run transcription or silence detection. The opening hook (first 5 s of the best-scored scene, or the timeline start) is protected and never cut.</p>
       <button disabled={!current || !result?.cuts || !result.cuts.length} onClick={() => void run('rough')}>Auto rough cut</button>
       {roughResult && <div className="cut-review"><h3>Review rough cut</h3>{roughResult.hook && <p>Hook protected: {(roughResult.hook.start / fps).toFixed(2)}–{(roughResult.hook.end / fps).toFixed(2)}s — this range is never cut.</p>}{roughResult.cuts.length === 0 && <p>Nothing left to cut after protecting the hook.</p>}{roughResult.cuts.map((cut, i) => <div className="cut-range" key={i}><label><input type="checkbox" checked={roughEnabled.includes(i)} onChange={e => setRoughEnabled(e.target.checked ? [...roughEnabled, i] : roughEnabled.filter(n => n !== i))} />{(cut.start / fps).toFixed(2)}–{(cut.end / fps).toFixed(2)}s</label><button onClick={() => seek(Math.max(0, cut.start - fps))}>Preview cut {i + 1}</button></div>)}<button disabled={!roughEnabled.length} onClick={() => void applyAnalysis({ type: 'cuts', cuts: roughResult.cuts.filter((_, i) => roughEnabled.includes(i)) }, roughResult.projectId, roughResult.revision)}>Apply {roughEnabled.length} cuts · one undo</button></div>}
+    </fieldset>
+    <fieldset disabled={busy}><legend>07 · Speakers, beats &amp; reframe</legend>
+      <p>Speaker turns are pause-based hints and beats are energy-based onset detection — both heuristics, not machine learning. Reframing is a centre crop: no face is detected or tracked.</p>
+      {gapNote && <p>{gapNote}</p>}
+      <button disabled={!current || !result?.transcript} onClick={() => void runGap('speakers')}>Detect speaker turns</button>
+      <button disabled={!eligible} onClick={() => void runGap('beats')}>Detect beats</button>
+      <label>Reframe target<select value={reframeTarget} onChange={e => setReframeTarget(e.target.value)}><option value="9:16">9:16 · vertical</option><option value="1:1">1:1 · square</option></select></label>
+      <button disabled={!native || !clip || asset?.videoStream == null || busy} onClick={() => void runGap('reframe')}>Plan reframe</button>
+      {speakers && <div className="cut-review"><h3>{speakers.turns.length} speaker turn{speakers.turns.length === 1 ? '' : 's'} · {speakers.method}</h3>{speakers.turns.length === 0 && <p>No turns found — transcribe a longer passage first.</p>}{speakers.turns.map((t, i) => <div className="cut-range" key={i}><span>{t.speaker} · {t.start.toFixed(2)}–{t.end.toFixed(2)}s · {t.wordCount} words</span><button onClick={() => seek(clip!.start + Math.round(t.start * fps))}>Seek</button></div>)}<p>{speakers.note}</p></div>}
+      {beats && <div className="cut-review"><h3>{beats.bpm === null ? 'No stable tempo' : `${beats.bpm.toFixed(1)} BPM`} · {beats.method}</h3><p>Confidence {(beats.confidence * 100).toFixed(0)}% · {beats.beats.length} beats.</p><p>{beats.note}</p></div>}
+      {reframe && <div className="cut-review"><h3>Reframe {reframe.target} · {reframe.method}</h3><p>Source {reframe.sourceWidth}×{reframe.sourceHeight} → crop {reframe.crop.width}×{reframe.crop.height} at {reframe.crop.x},{reframe.crop.y}.</p><p>FFmpeg filter: <code>{reframe.ffmpegFilter}</code></p><p>{reframe.note}</p></div>}
     </fieldset>
     <p role="status">{status}</p>{failure && <p role="alert" className="error">{failure}</p>}
   </section>;
