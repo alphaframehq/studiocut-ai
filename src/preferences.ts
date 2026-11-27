@@ -1,4 +1,5 @@
 // Shared, persisted user preferences — single source of truth.
+import type { Edl } from './edl';
 //
 // Before this module, Settings and the Export/Analysis panels each kept
 // their own copy: the encoder preference was saved but never read by the
@@ -224,6 +225,8 @@ export type DirectorHistoryEntry = {
   instruction: string;
   summary: string;
   at: number;
+  /** The validated EDL behind this proposal, when small enough to keep. */
+  edl?: Edl;
 };
 
 const DIRECTOR_HISTORY_PREFIX = 'studiocut.directorHistory.';
@@ -235,13 +238,37 @@ export function getDirectorHistory(projectId: string): DirectorHistoryEntry[] {
   try {
     const parsed = JSON.parse(raw) as DirectorHistoryEntry[];
     return Array.isArray(parsed)
-      ? parsed.filter(
-          e =>
-            (e?.kind === 'edit' || e?.kind === 'titles') &&
-            typeof e?.instruction === 'string' &&
-            typeof e?.summary === 'string' &&
-            typeof e?.at === 'number',
-        )
+      ? parsed
+          .filter(
+            e =>
+              (e?.kind === 'edit' || e?.kind === 'titles') &&
+              typeof e?.instruction === 'string' &&
+              typeof e?.summary === 'string' &&
+              typeof e?.at === 'number',
+          )
+          .map(e => {
+            // Keep the stored EDL only when it looks like an EDL and is
+            // small enough to keep in localStorage (≤ 32 KB of JSON).
+            if (e.edl === undefined) return e;
+            if (
+              !e.edl ||
+              typeof e.edl !== 'object' ||
+              !Array.isArray((e.edl as Edl).operations)
+            ) {
+              const { edl: _dropped, ...rest } = e;
+              return rest;
+            }
+            try {
+              if (JSON.stringify(e.edl).length > 32 * 1024) {
+                const { edl: _dropped, ...rest } = e;
+                return rest;
+              }
+            } catch {
+              const { edl: _dropped, ...rest } = e;
+              return rest;
+            }
+            return e;
+          })
       : [];
   } catch {
     return [];
@@ -252,6 +279,251 @@ export function addDirectorHistory(projectId: string, entry: DirectorHistoryEntr
   const next = [...getDirectorHistory(projectId), entry].slice(-DIRECTOR_HISTORY_MAX);
   write(`${DIRECTOR_HISTORY_PREFIX}${projectId}`, JSON.stringify(next));
   return next;
+}
+
+// --- Director feedback + learning (Phase 4) ------------------------------
+// What the user accepted / rejected / asked to redo, per operation type,
+// caption preset and pace. Local only; feeds the learned-preferences
+// summary sent with each proposal and the 3-accept streak rule that
+// updates Style DNA. Nothing here is sent to any provider except the
+// short text summary built by buildLearnedPreferences().
+export type DirectorFeedbackOutcome = 'accepted' | 'rejected' | 'modified';
+export type DirectorFeedback = {
+  ops: Record<string, { accepted: number; rejected: number; modified: number }>;
+  presets: Record<string, { accepted: number; rejected: number }>;
+  pace: Record<string, { accepted: number; rejected: number }>;
+  streaks: Record<string, number>;
+  updatedAt: number;
+};
+
+const DIRECTOR_FEEDBACK_KEY = 'studiocut.directorFeedback';
+const DIRECTOR_FEEDBACK_MAX_OUTCOMES = 500;
+
+function emptyDirectorFeedback(): DirectorFeedback {
+  return { ops: {}, presets: {}, pace: {}, streaks: {}, updatedAt: 0 };
+}
+
+function countOutcome(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
+}
+
+function validCounts(
+  value: unknown,
+  withModified: boolean,
+): Record<string, { accepted: number; rejected: number; modified: number }> | Record<string, { accepted: number; rejected: number }> {
+  const out: Record<string, { accepted: number; rejected: number; modified?: number }> = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!key || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const counts = entry as Record<string, unknown>;
+    out[key] = withModified
+      ? { accepted: countOutcome(counts.accepted), rejected: countOutcome(counts.rejected), modified: countOutcome(counts.modified) }
+      : { accepted: countOutcome(counts.accepted), rejected: countOutcome(counts.rejected) };
+  }
+  return out;
+}
+
+export function getDirectorFeedback(): DirectorFeedback {
+  const raw = read(DIRECTOR_FEEDBACK_KEY);
+  if (!raw) return emptyDirectorFeedback();
+  try {
+    const parsed = JSON.parse(raw) as Partial<DirectorFeedback>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyDirectorFeedback();
+    const streaks: Record<string, number> = {};
+    if (parsed.streaks && typeof parsed.streaks === 'object' && !Array.isArray(parsed.streaks)) {
+      for (const [key, value] of Object.entries(parsed.streaks)) {
+        if (key) streaks[key] = countOutcome(value);
+      }
+    }
+    return {
+      ops: validCounts(parsed.ops, true) as DirectorFeedback['ops'],
+      presets: validCounts(parsed.presets, false) as DirectorFeedback['presets'],
+      pace: validCounts(parsed.pace, false) as DirectorFeedback['pace'],
+      streaks,
+      updatedAt: typeof parsed.updatedAt === 'number' && Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : 0,
+    };
+  } catch {
+    return emptyDirectorFeedback();
+  }
+}
+
+function saveDirectorFeedback(feedback: DirectorFeedback): void {
+  feedback.updatedAt = Date.now();
+  write(DIRECTOR_FEEDBACK_KEY, JSON.stringify(feedback));
+}
+
+function totalOpOutcomes(feedback: DirectorFeedback): number {
+  return Object.values(feedback.ops).reduce(
+    (sum, c) => sum + c.accepted + c.rejected + c.modified,
+    0,
+  );
+}
+
+function halveCounts(feedback: DirectorFeedback): void {
+  // Over the 500-outcome cap: halve every recorded count (rounding down)
+  // and drop entries that reach zero, so old learning fades instead of
+  // being wiped outright.
+  const halve = <T extends { accepted: number; rejected: number; modified?: number }>(
+    record: Record<string, T>,
+  ): Record<string, T> => {
+    const next: Record<string, T> = {};
+    for (const [key, counts] of Object.entries(record)) {
+      const halved = {
+        ...counts,
+        accepted: Math.floor(counts.accepted / 2),
+        rejected: Math.floor(counts.rejected / 2),
+        ...(counts.modified !== undefined ? { modified: Math.floor(counts.modified / 2) } : {}),
+      } as T;
+      const total = halved.accepted + halved.rejected + (halved.modified ?? 0);
+      if (total > 0) next[key] = halved;
+    }
+    return next;
+  };
+  feedback.ops = halve(feedback.ops);
+  feedback.presets = halve(feedback.presets) as DirectorFeedback['presets'];
+  feedback.pace = halve(feedback.pace) as DirectorFeedback['pace'];
+}
+
+function enforceDirectorFeedbackCap(feedback: DirectorFeedback): void {
+  if (totalOpOutcomes(feedback) > DIRECTOR_FEEDBACK_MAX_OUTCOMES) halveCounts(feedback);
+}
+
+export function recordDirectorFeedback(
+  outcomes: { opType: string; outcome: DirectorFeedbackOutcome }[],
+): void {
+  if (!outcomes.length) return;
+  const feedback = getDirectorFeedback();
+  for (const { opType, outcome } of outcomes) {
+    if (!opType || (outcome !== 'accepted' && outcome !== 'rejected' && outcome !== 'modified')) continue;
+    const entry = feedback.ops[opType] ?? { accepted: 0, rejected: 0, modified: 0 };
+    entry[outcome] += 1;
+    feedback.ops[opType] = entry;
+  }
+  enforceDirectorFeedbackCap(feedback);
+  saveDirectorFeedback(feedback);
+}
+
+export function recordPresetFeedback(preset: string, outcome: 'accepted' | 'rejected'): void {
+  if (!preset) return;
+  const feedback = getDirectorFeedback();
+  const entry = feedback.presets[preset] ?? { accepted: 0, rejected: 0 };
+  entry[outcome] += 1;
+  feedback.presets[preset] = entry;
+  const streakKey = `preset:${preset}`;
+  feedback.streaks[streakKey] = outcome === 'accepted' ? (feedback.streaks[streakKey] ?? 0) + 1 : 0;
+  enforceDirectorFeedbackCap(feedback);
+  saveDirectorFeedback(feedback);
+}
+
+export function recordPaceFeedback(pace: string, outcome: 'accepted' | 'rejected'): void {
+  if (!pace) return;
+  const feedback = getDirectorFeedback();
+  const entry = feedback.pace[pace] ?? { accepted: 0, rejected: 0 };
+  entry[outcome] += 1;
+  feedback.pace[pace] = entry;
+  const streakKey = `pace:${pace}`;
+  feedback.streaks[streakKey] = outcome === 'accepted' ? (feedback.streaks[streakKey] ?? 0) + 1 : 0;
+  enforceDirectorFeedbackCap(feedback);
+  saveDirectorFeedback(feedback);
+}
+
+const DIRECTOR_OP_LABELS: Record<string, string> = {
+  lut: 'Grade (lut)',
+  captions: 'Captions',
+  captionStyle: 'Caption style',
+  trim: 'Trim',
+  split: 'Split',
+  delete: 'Delete',
+  ripple: 'Ripple',
+  move: 'Move',
+  jCut: 'J cut',
+  lCut: 'L cut',
+  zoom: 'Zoom',
+  duck: 'Duck',
+  insert: 'Insert',
+  broll: 'B-roll',
+  sfx: 'SFX',
+  addTrack: 'Add track',
+};
+
+export function directorOpLabel(opType: string): string {
+  return DIRECTOR_OP_LABELS[opType] ?? (opType.charAt(0).toUpperCase() + opType.slice(1));
+}
+
+export function buildLearnedPreferences(): string {
+  const feedback = getDirectorFeedback();
+  const lines: string[] = [];
+  for (const [opType, counts] of Object.entries(feedback.ops)) {
+    const total = counts.accepted + counts.rejected + counts.modified;
+    if (total < 2) continue;
+    const label = directorOpLabel(opType);
+    let line = `${label}: accepted ${counts.accepted}/${total}.`;
+    if (counts.rejected >= 2 && counts.rejected > counts.accepted) {
+      const noun = label.replace(/\s*\(.*?\)\s*/, '').toLowerCase();
+      line = `${label}: rejected ${counts.rejected}/${total} — suggest fewer ${noun} changes.`;
+    }
+    lines.push(line);
+  }
+  for (const [preset, counts] of Object.entries(feedback.presets)) {
+    const total = counts.accepted + counts.rejected;
+    if (total < 2) continue;
+    lines.push(`Caption preset: ${preset} accepted ${counts.accepted}/${total}.`);
+  }
+  for (const [pace, counts] of Object.entries(feedback.pace)) {
+    const total = counts.accepted + counts.rejected;
+    if (total < 2) continue;
+    lines.push(`Pace: ${pace} accepted ${counts.accepted}/${total}.`);
+  }
+  return lines.join(' ');
+}
+
+export function maybeUpdateStyleDnaFromFeedback(): { changed: boolean; note: string } {
+  const feedback = getDirectorFeedback();
+  const dna = getStyleDna();
+  const next = { ...dna };
+  const notes: string[] = [];
+  let changed = false;
+  let spent = false;
+  for (const [key, streak] of Object.entries(feedback.streaks)) {
+    if (streak < 3) continue;
+    spent = true;
+    if (key.startsWith('preset:')) {
+      const preset = key.slice('preset:'.length);
+      if ((STYLE_DNA_FIELDS.captionPreset as readonly string[]).includes(preset)) {
+        next.captionPreset = preset as StyleDNA['captionPreset'];
+        notes.push(`caption preset → ${preset.charAt(0).toUpperCase() + preset.slice(1)}`);
+        changed = true;
+      }
+    } else if (key.startsWith('pace:')) {
+      const pace = key.slice('pace:'.length);
+      if ((STYLE_DNA_FIELDS.pace as readonly string[]).includes(pace)) {
+        next.pace = pace as StyleDNA['pace'];
+        notes.push(`pace → ${pace.charAt(0).toUpperCase() + pace.slice(1)}`);
+        changed = true;
+      }
+    }
+    // The streak is spent whether or not the value was usable.
+    feedback.streaks[key] = 0;
+  }
+  if (!changed) {
+    // Still persist the spent streaks (if any were reset on invalid values).
+    if (spent) saveDirectorFeedback(feedback);
+    return { changed: false, note: '' };
+  }
+  setStyleDna(next);
+  saveDirectorFeedback(feedback);
+  return { changed: true, note: `Style updated from your choices: ${notes.join('; ')}` };
+}
+
+export function resetDirectorFeedback(): void {
+  try {
+    localStorage.removeItem(DIRECTOR_FEEDBACK_KEY);
+  } catch {
+    // Storage unavailable — nothing to clear.
+  }
+  setStyleDna({ ...DEFAULT_STYLE_DNA });
 }
 
 // --- Recent projects (Phase 2a) ------------------------------------------

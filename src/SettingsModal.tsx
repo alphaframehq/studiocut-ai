@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { X } from 'lucide-react';
-import { getEncoderPreference, getStyleDna, getWhisperBinary, getWhisperModel, setEncoderPreference, setStyleDna, setWhisperBinary, setWhisperModel, type ListedModel, type StyleDNA } from './preferences';
+import { DEFAULT_STYLE_DNA, getEncoderPreference, getStyleDna, getWhisperBinary, getWhisperModel, resetDirectorFeedback, setEncoderPreference, setStyleDna, setWhisperBinary, setWhisperModel, type ListedModel, type StyleDNA } from './preferences';
 
 type Provider = 'gemini' | 'openai' | 'claude' | 'groq' | 'openrouter' | 'compatible' | 'ollama' | 'bedrock' | 'vertex';
 type LicenseStatus = { fingerprint: string; mode: string; licensed: boolean; license: { name: string; email: string; expiresAt: number | null } | null };
@@ -155,6 +155,7 @@ export function SettingsModal() {
           <label>Intro style<select value={styleDna.introStyle} onChange={e => setStyleDnaState({ ...styleDna, introStyle: e.target.value as StyleDNA['introStyle'] })}><option value="hook-first">Hook first · strongest line opens</option><option value="cold-open">Cold open · scene first, no title</option><option value="title-card">Title card · name up front</option><option value="none">No intro treatment</option></select></label>
           <label>Music mood<select value={styleDna.musicMood} onChange={e => setStyleDnaState({ ...styleDna, musicMood: e.target.value as StyleDNA['musicMood'] })}><option value="none">No music preference</option><option value="upbeat">Upbeat</option><option value="calm">Calm</option><option value="dramatic">Dramatic</option><option value="cinematic">Cinematic</option></select></label>
           <button className="button primary" onClick={() => { setStyleDna(styleDna); setStyleSaved('Style saved. Export and captions will open with these choices.'); }}>Save my style</button>
+          <button className="button secondary" onClick={() => { resetDirectorFeedback(); setStyleDnaState({ ...DEFAULT_STYLE_DNA }); setStyleSaved('Learning cleared; style reset to defaults.'); }}>Reset learning</button>
           <div role="status" aria-live="polite">{styleSaved}</div>
         </section>}
         {tab === 'license' && <section aria-label="License">
