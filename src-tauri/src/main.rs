@@ -289,6 +289,201 @@ async fn detect_filler_cuts(
     .map_err(|e| e.to_string())?
 }
 
+/// Colour scopes for one clip frame (approximate — computed from a
+/// sample frame no wider than 320 px; a grading aid, not a broadcast
+/// measurement).
+#[tauri::command]
+async fn analyze_scopes(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    at_seconds: f64,
+) -> Result<studiocut_ai::scopes::ScopeData, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::scopes::analyze_scopes(&project, clip_id, at_seconds)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Proxy status for one asset. The original media is never modified.
+#[tauri::command]
+async fn proxy_status(
+    app: tauri::AppHandle,
+    state: State<'_, Workspace>,
+    id: uuid::Uuid,
+) -> Result<studiocut_ai::proxy::ProxyStatus, String> {
+    use tauri::Manager;
+    let asset = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .and_then(|p| p.assets.iter().find(|a| a.id == id))
+        .cloned()
+        .ok_or("Asset not in current project")?;
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("media");
+    tauri::async_runtime::spawn_blocking(move || studiocut_ai::proxy::proxy_status(&root, &asset))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Generate (or regenerate) the 540p proxy for a video asset. The
+/// original file is only read, never written.
+#[tauri::command]
+async fn generate_proxy(
+    app: tauri::AppHandle,
+    state: State<'_, Workspace>,
+    id: uuid::Uuid,
+) -> Result<studiocut_ai::proxy::ProxyStatus, String> {
+    use tauri::Manager;
+    let asset = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .and_then(|p| p.assets.iter().find(|a| a.id == id))
+        .cloned()
+        .ok_or("Asset not in current project")?;
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("media");
+    tauri::async_runtime::spawn_blocking(move || studiocut_ai::proxy::generate_proxy(&root, &asset))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Delete an asset's proxy and its state record. The original media is
+/// never touched.
+#[tauri::command]
+async fn delete_proxy(
+    app: tauri::AppHandle,
+    state: State<'_, Workspace>,
+    id: uuid::Uuid,
+) -> Result<studiocut_ai::proxy::ProxyStatus, String> {
+    use tauri::Manager;
+    let asset = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .and_then(|p| p.assets.iter().find(|a| a.id == id))
+        .cloned()
+        .ok_or("Asset not in current project")?;
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("media");
+    tauri::async_runtime::spawn_blocking(move || studiocut_ai::proxy::delete_proxy(&root, &asset))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Resolve the ready proxy file for preview use. Callers fall back to
+/// the original media when this errors.
+#[tauri::command]
+fn proxy_playback_source(
+    app: tauri::AppHandle,
+    state: State<Workspace>,
+    id: uuid::Uuid,
+) -> Result<String, String> {
+    use tauri::Manager;
+    let current = state.0.lock().map_err(|e| e.to_string())?;
+    let asset = current
+        .as_ref()
+        .and_then(|p| p.assets.iter().find(|a| a.id == id))
+        .ok_or("Asset not in current project")?;
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("media");
+    let path = studiocut_ai::proxy::proxy_source(&root, asset)?;
+    app.asset_protocol_scope()
+        .allow_file(&path)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Speaker-turn hints for a word-timestamped transcript (heuristic —
+/// pause-based, not machine learning; see ai_gaps::diarize_clip).
+#[tauri::command]
+async fn detect_speakers(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    words: Vec<studiocut_ai::transcription::TimedText>,
+    min_pause_secs: f64,
+) -> Result<studiocut_ai::ai_gaps::DiarizationResult, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::ai_gaps::diarize_clip(&project, clip_id, &words, min_pause_secs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Music beat detection (heuristic — energy-based onset detection,
+/// not machine learning; see ai_gaps::detect_beats_clip).
+#[tauri::command]
+async fn detect_beats(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+) -> Result<studiocut_ai::ai_gaps::BeatResult, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::ai_gaps::detect_beats_clip(&project, clip_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Centre-crop reframe plan for a portrait/square target. Face
+/// tracking is unavailable (see ai_gaps::reframe_clip).
+#[tauri::command]
+async fn reframe_clip(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    target: String,
+    focus_x: Option<f64>,
+    focus_y: Option<f64>,
+) -> Result<studiocut_ai::ai_gaps::ReframePlan, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::ai_gaps::reframe_clip(&project, clip_id, &target, focus_x, focus_y)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Whether local whisper.cpp exposes speaker segmentation, and which
+/// diarization method StudioCut AI uses.
+#[tauri::command]
+fn diarization_capability() -> studiocut_ai::ai_gaps::DiarizationCapability {
+    studiocut_ai::ai_gaps::diarization_capability()
+}
+
+/// Whether face tracking is available for auto-reframe, and which
+/// reframe method StudioCut AI uses.
+#[tauri::command]
+fn reframe_capability() -> studiocut_ai::ai_gaps::ReframeCapability {
+    studiocut_ai::ai_gaps::reframe_capability()
+}
+
 /// Auto rough cut: merges silence, filler and low-energy cuts the
 /// user already ran, protecting the hook (scene scores pick the hook;
 /// see analysis::rough_cut). Pure combination — it does not re-run
@@ -1039,9 +1234,12 @@ fn lut_validate(text: String) -> Result<u32, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(Workspace::default())
         .manage(AiState::default())
         .manage(studiocut_ai::render::ExportManager::default())
+        .manage(studiocut_ai::mcp::McpCredentials::default())
         .invoke_handler(tauri::generate_handler![
             export_start,
             export_status,
@@ -1086,7 +1284,27 @@ fn main() {
             add_captions,
             license_status,
             license_activate,
-            license_deactivate
+            license_deactivate,
+            analyze_scopes,
+            proxy_status,
+            generate_proxy,
+            delete_proxy,
+            proxy_playback_source,
+            detect_speakers,
+            detect_beats,
+            reframe_clip,
+            diarization_capability,
+            reframe_capability,
+            studiocut_ai::mcp::mcp_list_presets,
+            studiocut_ai::mcp::mcp_higgsfield_models,
+            studiocut_ai::mcp::mcp_set_credential,
+            studiocut_ai::mcp::mcp_test_connection,
+            studiocut_ai::mcp::mcp_list_tools,
+            studiocut_ai::mcp::mcp_call_tool,
+            studiocut_ai::mcp::mcp_higgsfield_submit,
+            studiocut_ai::mcp::mcp_higgsfield_status,
+            studiocut_ai::mcp::mcp_higgsfield_cancel,
+            studiocut_ai::mcp::mcp_download_result
         ])
         .run(tauri::generate_context!())
         .expect("Failed to launch StudioCut AI");
