@@ -30,6 +30,10 @@
   },
   "bundle": {
     "active": true,
+    "externalBin": [
+      "binaries/ffmpeg",
+      "binaries/ffprobe"
+    ],
     "targets": [
       "deb",
       "nsis",

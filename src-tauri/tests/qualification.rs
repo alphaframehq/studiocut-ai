@@ -11,7 +11,7 @@ use studiocut_ai::{
     edl::Effects,
     filtergraph::ExportSettings,
     finishing::Finishing,
-    media::import_media,
+    media::{ffmpeg_path, import_media},
     render::{bounded_command, ExportManager, Snapshot},
     timeline::{Caption, CaptionWord, Clip, Track},
     Project,
@@ -29,7 +29,7 @@ fn run(command: Command) -> Vec<u8> {
 }
 
 fn ffmpeg(root: &Path, args: &[&str]) -> Vec<u8> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(ffmpeg_path());
     command
         .current_dir(root)
         .args([
