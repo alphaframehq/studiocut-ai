@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod ai_gaps;
 pub mod analysis;
 pub mod credentials;
 pub mod director;
@@ -6,9 +7,12 @@ pub mod edl;
 pub mod filtergraph;
 pub mod finishing;
 pub mod license;
+pub mod mcp;
 pub mod media;
 pub mod progress_channel;
+pub mod proxy;
 pub mod render;
+pub mod scopes;
 pub mod thumbnail;
 pub mod timeline;
 pub mod transcription;
