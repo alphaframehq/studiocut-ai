@@ -476,8 +476,9 @@ async fn detect_beats(
     .map_err(|e| e.to_string())?
 }
 
-/// Centre-crop reframe plan for a portrait/square target. Face
-/// tracking is unavailable (see ai_gaps::reframe_clip).
+/// Centre-crop reframe plan for a portrait/square target. No face
+/// is detected by this plan itself; face tracking is available
+/// separately (see ai_gaps::reframe_face_track_clip).
 #[tauri::command]
 async fn reframe_clip(
     state: State<'_, Workspace>,
@@ -498,7 +499,9 @@ async fn reframe_clip(
 
 /// Motion-weighted reframe plan for a portrait/square target: the
 /// crop centres on the highest-motion region, falling back to the
-/// centre crop for static frames. No face is detected or tracked.
+/// centre crop for static frames. No face is detected or tracked by
+/// this plan; face tracking is available separately (see
+/// ai_gaps::reframe_face_track_clip).
 #[tauri::command]
 async fn reframe_motion_clip(
     state: State<'_, Workspace>,
@@ -511,6 +514,27 @@ async fn reframe_motion_clip(
     let project = analysis_snapshot(&state, project_id, revision)?;
     tauri::async_runtime::spawn_blocking(move || {
         studiocut_ai::ai_gaps::reframe_motion_clip(&project, clip_id, &target, at_seconds)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Face-tracked reframe plan for a portrait/square target: the crop
+/// centre follows the one face detected consistently across the clip
+/// (see ai_gaps::reframe_face_track_clip). When no face is found
+/// consistently, the plan falls back to the motion-weighted reframe
+/// and says so.
+#[tauri::command]
+async fn reframe_face_track(
+    state: State<'_, Workspace>,
+    project_id: uuid::Uuid,
+    revision: u64,
+    clip_id: uuid::Uuid,
+    target: String,
+) -> Result<studiocut_ai::ai_gaps::ReframePlan, String> {
+    let project = analysis_snapshot(&state, project_id, revision)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::ai_gaps::reframe_face_track_clip(&project, clip_id, &target)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1351,6 +1375,7 @@ fn main() {
             detect_beats,
             reframe_clip,
             reframe_motion_clip,
+            reframe_face_track,
             diarization_capability,
             reframe_capability,
             studiocut_ai::mcp::mcp_list_presets,
