@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { useProject } from './store';
-import { getEncoderPreference, getStyleDna } from './preferences';
+import { getEncoderPreference, getExportUseProxy, getStyleDna, setExportUseProxy } from './preferences';
+import { mixerGainsForProject } from './AudioMixer';
 import './finishing.css';
 type Job = { version: 1; id: string; sequence: number; timestamp: number; state: string; progress: number; encoder: string | null; disclosure: string; output: string; error: string | null };
 const active = (job: Job | null) => !!job && ['probing', 'rendering', 'validating'].includes(job.state);
@@ -19,10 +20,11 @@ export function ExportModal({ hidden = false }: { hidden?: boolean }) {
   const [open, setOpen] = useState(false), [pending, setPending] = useState(false), [job, setJob] = useState<Job | null>(null), [error, setError] = useState('');
   const [container, setContainer] = useState('mp4'), [height, setHeight] = useState(1080), [fps, setFps] = useState(30), [encoder, setEncoder] = useState<string>(getEncoderPreference), [output, setOutput] = useState('');
   const [aspect, setAspect] = useState('landscape'), [fill, setFill] = useState('fit'), [preset, setPreset] = useState<string>('youtube');
+  const [useProxy, setUseProxy] = useState(getExportUseProxy);
   // Re-read the Settings preferences every time the dialog opens, so a
   // change made in Settings while this dialog was closed still applies —
   // including a saved Style DNA (aspect/fill).
-  useEffect(() => { if (open) { setEncoder(getEncoderPreference()); const dna = getStyleDna(); setAspect(dna.aspect); setFill(dna.fill); setPreset(dna.aspect === 'vertical' ? 'shorts' : dna.aspect === 'square' ? 'custom' : 'youtube'); } }, [open]);
+  useEffect(() => { if (open) { setEncoder(getEncoderPreference()); setUseProxy(getExportUseProxy()); const dna = getStyleDna(); setAspect(dna.aspect); setFill(dna.fill); setPreset(dna.aspect === 'vertical' ? 'shorts' : dna.aspect === 'square' ? 'custom' : 'youtube'); } }, [open]);
   useEffect(() => {
     if (!open || !isTauri()) return;
     let stopped = false, timer: ReturnType<typeof setTimeout>, failures = 0;
@@ -52,7 +54,7 @@ export function ExportModal({ hidden = false }: { hidden?: boolean }) {
       {!isTauri() && <p className="finish-warning" role="status">Export requires the desktop app and installed FFmpeg / FFprobe. Browser preview cannot render local media.</p>}
       <form onSubmit={async e => {
         e.preventDefault(); if (!project || !isTauri()) return; setPending(true); setError('');
-        try { setJob(await invoke<Job>('export_start', { projectId: project.id, revision: project.revision, output, settings: { container, height, fps, encoder, aspect, fill } })); }
+        try { setJob(await invoke<Job>('export_start', { projectId: project.id, revision: project.revision, output, settings: { container, height, fps, encoder, aspect, fill, useProxy, trackGains: mixerGainsForProject(project.id, project.tracks.filter(t => t.kind === 'audio').map(t => t.id)) } })); }
         catch (e) { setError(String(e)); } finally { setPending(false); }
       }}>
         <fieldset disabled={active(job) || pending}><legend>Output settings</legend>
@@ -66,6 +68,11 @@ export function ExportModal({ hidden = false }: { hidden?: boolean }) {
           <label>Frame rate<select value={fps} onChange={e => setFps(Number(e.target.value))}>{[24, 30, 60].map(n => <option key={n} value={n}>{n} fps</option>)}</select></label>
         </div><label>Encoder<select value={encoder} onChange={e => setEncoder(e.target.value)}><option value="auto">Auto · probe hardware, then CPU</option><option value="libx264">libx264 · CPU</option><option value="h264_nvenc">NVIDIA · H.264</option><option value="hevc_videotoolbox">Apple VideoToolbox · HEVC</option><option value="h264_amf">AMD AMF · H.264</option><option value="h264_qsv">Intel Quick Sync · H.264</option></select></label>
           <small>Each hardware candidate runs a real encode probe. If unavailable, libx264 CPU fallback is disclosed below. {fill === 'cover' ? 'Cover fills the frame edge to edge; the sides or top and bottom are cropped. True face-tracked reframe arrives in a later milestone.' : 'Fit keeps the whole frame; bars fill the unused space.'}</small>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12 }}>
+            <input type="checkbox" checked={useProxy} onChange={e => { const next = e.target.checked; setUseProxy(next); setExportUseProxy(next); }} style={{ marginTop: 2 }} />
+            <span>Render from 540p proxy files when available</span>
+          </label>
+          {useProxy && <p className="finish-warning" role="status">Proxy export is lower resolution (540p). Clips without a ready proxy use the original media. The export summary states how many clips used proxies. Original files are never modified.</p>}
           <label>Absolute output path<input required value={output} onChange={e => setOutput(e.target.value)} placeholder={`Full path to a new .${container} file`} /></label>
           <button className="primary" type="submit" disabled={!isTauri() || !project?.tracks.some(t => t.clips.length)}>Start export</button>
         </fieldset>

@@ -30,9 +30,18 @@ function gainKey(projectId: string, trackId: string) {
   return `studiocut-mixer-gain:${projectId}:${trackId}`;
 }
 
-function loadGain(projectId: string, trackId: string): number {
+/** Stored mixer gain for one track, in dB. Unstored tracks read 0 dB. */
+export function mixerGainDb(projectId: string, trackId: string): number {
   const stored = Number(localStorage.getItem(gainKey(projectId, trackId)));
   return Number.isFinite(stored) ? clampGainDb(stored) : 0;
+}
+
+/** Stored mixer gains for the given tracks, keyed by track id, for
+ * export and preview playback. Tracks without a stored gain read 0 dB. */
+export function mixerGainsForProject(projectId: string, trackIds: string[]): Record<string, number> {
+  const gains: Record<string, number> = {};
+  for (const trackId of trackIds) gains[trackId] = mixerGainDb(projectId, trackId);
+  return gains;
 }
 
 function LoudnessMeter({ loudness, gainDb }: { loudness: TrackLoudness; gainDb: number }) {
@@ -61,7 +70,7 @@ function MixerTrack({ trackId }: { trackId: string }) {
   const [measuring, setMeasuring] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
-    if (project) setGainDb(loadGain(project.id, trackId));
+    if (project) setGainDb(mixerGainDb(project.id, trackId));
     setLoudness(null);
   }, [project?.id, trackId]);
   if (!project || !track) return null;
@@ -115,7 +124,7 @@ export function AudioMixer() {
   return <section className="audio-mixer" aria-label="Audio mixer">
     <header><strong>Audio Mixer</strong><span>GAIN · MUTE · SOLO · LOUDNESS</span></header>
     <p className="finish-note">
-      Mute and solo apply immediately in preview. Gain is stored per track for reference only — it is not applied to preview playback or export in this phase.
+      Mute and solo apply immediately in preview. Gain is applied in preview playback and on export.
     </p>
     {audioTracks.length === 0
       ? <p className="finish-note">Add an audio track to mix it here.</p>
