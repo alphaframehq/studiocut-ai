@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StudioCut AI — Local-first video editor with an AI Director</title>
+<meta name="description" content="StudioCut AI is a local-first, desktop video editor with an AI Director. Your media stays on your machine. Version 0.1.0 is unreleased; no installers have been published yet.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="#top">StudioCut <span>AI</span></a>
+    <nav class="site-nav" aria-label="Page sections">
+      <a href="#features">Features</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#download">Download</a>
+      <a href="#support">Support</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Local-first video editing &middot; Desktop app</p>
+      <h1>StudioCut AI</h1>
+      <p class="lede">A local-first video editor with an AI Director. Your media stays on
+      your machine &mdash; originals are never copied or uploaded. Describe the edit in
+      plain language, review the proposal, and approve it before anything touches
+      your timeline.</p>
+      <p class="status" role="status"><strong>Development status:</strong> Version 0.1.0
+      is unreleased. No installers have been published yet, and the app has not yet
+      run on a real desktop. This page describes what is being built &mdash; not what
+      you can download today.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="https://github.com/alphaframehq/studiocut-ai">View the source on GitHub</a>
+        <a class="btn btn-ghost" href="#download">Release status</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="section">
+    <div class="wrap">
+      <h2>Features</h2>
+      <p class="section-intro">Everything below reflects the current state of the project
+      in the repository. Where a capability is approximate or heuristic, that is stated
+      plainly.</p>
+
+      <div class="feature-grid">
+        <article class="card">
+          <h3>Edit</h3>
+          <ul>
+            <li>Versioned <code>.studiocut</code> project files with atomic save and reopen,
+            and 50-step session undo.</li>
+            <li>Multi-track video, audio and caption timeline: move, trim, split, ripple
+            delete, mute, solo, lock, linked audio/video clips, zoom, and 0.25&ndash;4&times;
+            speed.</li>
+            <li>Real video preview driven by an audio-master clock.</li>
+            <li>Media import with FFprobe metadata, a SQLite index, thumbnails and
+            waveforms. Originals are referenced by path and fingerprint &mdash; never copied.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h3>Understand</h3>
+          <ul>
+            <li>Silence detection and local Whisper transcription, or cloud transcription
+            with your own API key.</li>
+            <li>Kinetic captions in four presets.</li>
+            <li>Speaker turns, beat detection and reframing are heuristics, not machine
+            learning: speaker turns are pause-based hints, beats are energy-based onset
+            detection, and reframing is a centre crop &mdash; no face is detected or tracked.</li>
+            <li>Scopes (waveform, vectorscope, histogram) are approximate &mdash; computed from
+            a sample frame no wider than 320&nbsp;px. Use them as a grading aid, not a
+            broadcast measurement.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h3>Direct</h3>
+          <ul>
+            <li>AI Director and Chat-to-Edit: describe the edit in plain language and the
+            Director proposes a single edit decision list, which you review and approve
+            before anything touches the timeline. One undo checkpoint per approval.</li>
+            <li>The AI Director works with your own API keys (bring your own key). There
+            is no built-in key and no cloud account.</li>
+            <li>MCP support is bring-your-own-key: connect your own MCP servers with your
+            own credentials. Keys are stored in the operating system credential manager
+            or session-only memory, never in project files.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h3>Finish</h3>
+          <ul>
+            <li>Colour grading, LUTs (.cube), and audio mastering with ducking.</li>
+            <li>Deterministic FFmpeg export (MP4/MOV, 1080p/4K, 24/30/60 fps) with
+            progress, cancel, validation and atomic publish. Existing files are never
+            overwritten.</li>
+            <li>Finishing controls are export-only: the preview does not show grading yet.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h3>Privacy &amp; licensing</h3>
+          <ul>
+            <li>Local-first by design: media and projects stay on your machine.</li>
+            <li>An offline licence gates only AI Director proposals and export. Editing,
+            import and transcription work unlicensed.</li>
+            <li>Known limits: no native desktop verification yet on real Windows, macOS or
+            Linux hardware; no autosave yet &mdash; save explicitly; one export job at a
+            time; a maximum of 128 clips per render.</li>
+          </ul>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="screenshots" class="section section-alt">
+    <div class="wrap">
+      <h2>Screenshots</h2>
+      <p>Real screenshots will appear here after the first Windows CI run produces them.
+      No mock-up or generated image is shown as a screenshot of the app.</p>
+      <div class="screenshot-placeholder" aria-label="Screenshot placeholder">
+        <p>Screenshots coming soon &mdash; captured from a real build, once the first
+        Windows CI run has produced one.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="download" class="section">
+    <div class="wrap">
+      <h2>Download &amp; release</h2>
+      <p>There is nothing to download yet. Version 0.1.0 is unreleased and no installers
+      have been published. When installers are ready, they will appear on the
+      project&rsquo;s GitHub Releases page:</p>
+      <p><a class="btn btn-primary" href="https://github.com/alphaframehq/studiocut-ai/releases">GitHub Releases &mdash; alphaframehq/studiocut-ai</a></p>
+      <p class="muted">Installers are planned for Linux (.deb), Windows (NSIS/MSI) and
+      macOS (.dmg), built on each platform&rsquo;s native operating system. No installer
+      file names or versions are listed here because none exist yet.</p>
+    </div>
+  </section>
+
+  <section id="support" class="section section-alt">
+    <div class="wrap">
+      <h2>Support the project</h2>
+      <p>StudioCut AI is developed by AlphaFrame. If the project is useful to you, you
+      can support its development:</p>
+      <p><a class="btn btn-gold" href="https://buymeacoffee.com/devnarayan9">Buy Me a Coffee &mdash; buymeacoffee.com/devnarayan9</a></p>
+      <p class="muted">Questions, bug reports and contributions belong on the
+      <a href="https://github.com/alphaframehq/studiocut-ai">GitHub repository</a>.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p>StudioCut AI &mdash; a local-first video editor with an AI Director.</p>
+    <p><a href="https://github.com/alphaframehq/studiocut-ai">github.com/alphaframehq/studiocut-ai</a>
+    &middot; MIT License &middot; Copyright 2026 AlphaFrame</p>
+    <p class="muted">Version 0.1.0 is unreleased. This site describes work in progress;
+    nothing on this page is a download.</p>
+  </div>
+</footer>
+</body>
+</html>
