@@ -119,8 +119,9 @@ code uses the `--color-*` names.
   `--color-surface-step-*`) in a follow-up pass — do not bulk-replace by eye.
 - A few 8–10px body strings remain in the old styles; raise them to 11–12px
   when their component is next touched.
-- Tailwind is installed but unused — either adopt its utilities for new
-  components or remove the dependency; do not mix both systems silently.
+- Tailwind was removed (Nov 2026 cleanup): no utility classes were used —
+  all styling is the custom token system in `src/design-tokens.css` and the
+  component stylesheets. Do not reintroduce a second styling system.
 - The footer step label is still hard-coded (`STEP 03 / TIMELINE & PREVIEW`).
 
 ## How to add a component
