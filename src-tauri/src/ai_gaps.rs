@@ -8,6 +8,11 @@
 //!   not machine learning, and the result must never be described as
 //!   model output.
 //! * `"centre-crop"` — a geometric crop with no subject detection.
+//! * `"motion-weighted"` — a crop centred on the highest-motion region
+//!   (see [`reframe_motion_clip`]); motion is a proxy for the subject,
+//!   not subject detection.
+//! * `"face-tracked"` — a crop whose centre follows a detected face
+//!   over time (see [`reframe_face_track_clip`]).
 //! * `"model"` — reserved for a future local model. No function in this
 //!   module returns `"model"` today.
 //! * `"unavailable"` — the capability does not exist in this build.
@@ -45,13 +50,11 @@
 //!
 //! ## Auto-reframe
 //!
-//! No face-detection model is bundled with StudioCut AI (no ONNX,
-//! Caffe, or GGML face model is present in the repository), so face
-//! tracking is unavailable. [`reframe_crop`] computes a centre crop
-//! (or a crop centred on a caller-supplied focus point) for the 9:16
-//! and 1:1 targets and returns the FFmpeg `crop` filter for it. The
-//! method is labelled `"centre-crop"` and the note states that no face
-//! is detected. [`reframe_motion_clip`] offers a motion-weighted
+//! [`reframe_crop`] computes a centre crop (or a crop centred on a
+//! caller-supplied focus point) for the 9:16 and 1:1 targets and
+//! returns the FFmpeg `crop` filter for it. The method is labelled
+//! `"centre-crop"` and the note states that no face is detected by the
+//! crop itself. [`reframe_motion_clip`] offers a motion-weighted
 //! alternative: it compares two frames 0.5 s apart, finds the region
 //! with the strongest luma change, and centres the crop there
 //! (method `"motion-weighted"`). When the frames are effectively
@@ -60,19 +63,27 @@
 //! can pull the crop away from a still subject. See
 //! [`reframe_capability`].
 //!
-//! A face-tracked reframe was investigated for this round and is not
-//! viable without a new inference runtime. The smallest
-//! license-clean candidates are YuNet (MIT, about 230 KB ONNX, OpenCV
-//! Zoo) and UltraFace (MIT, about 1.2 MB ONNX, ONNX Model Zoo); both
-//! need an ONNX runtime. The `ort` crate downloads a 20–50 MB native
-//! ONNX Runtime library at build time and has no prebuilt library for
-//! every target, and the pure-Rust alternative (`tract`) is a large
-//! new crate family that adds roughly 26 MB to release binaries and
-//! requires hand-written anchor decoding and non-maximum suppression
-//! for YuNet. Either route needs a Cargo.lock change and a dedicated,
-//! CI-verified round. Until then, motion-weighted reframe is the
-//! honest substitute and the capability report says face tracking is
-//! unavailable.
+//! [`reframe_face_track_clip`] is the face-tracked reframe: it samples
+//! frames across the clip, runs the bundled BlazeFace full-range
+//! model (see [`crate::face`]) on each sample, selects the one face
+//! that appears consistently, smooths its track, and returns a plan
+//! (method `"face-tracked"`) whose crop centre follows the face over
+//! time. When no face is found consistently, the plan falls back to
+//! the motion-weighted reframe and says so — it never claims a face
+//! was tracked when it was not.
+//!
+//! YuNet and UltraFace were considered as face-detection candidates
+//! and rejected as the primary model: both are trained on WIDER FACE
+//! (CC BY-NC-ND 4.0, academic-research-only terms), so whether the
+//! dataset terms encumber their MIT-licensed weights for a commercial
+//! open-source app is unsettled, and neither is unambiguously
+//! license-clean for this use. An earlier revision of this document
+//! called them license-clean; that was inaccurate and is corrected
+//! here. BlazeFace was chosen instead: it is Apache-2.0 licensed and
+//! was trained on consented images, not on WIDER FACE. It runs under
+//! `tract` (pure Rust, CPU-only) from a small ONNX file converted
+//! in-house from the official `.tflite` — see
+//! `assets/face-detection/README.md`.
 //!
 //! ## Coordinator integration (main.rs — this module does not register
 //! ## commands itself, because the workspace state lives in main.rs)
@@ -139,8 +150,8 @@
 //! /// Motion-weighted reframe plan for a portrait/square target: the
 //! /// crop follows the highest-motion region at the playhead instead
 //! /// of the static centre, falling back to the centre crop when the
-//! /// frames are static. Face tracking is unavailable (see
-//! /// ai_gaps::reframe_motion_clip).
+//! /// frames are static. Face tracking is available separately (see
+//! /// ai_gaps::reframe_face_track_clip).
 //! #[tauri::command]
 //! async fn reframe_motion_clip(
 //!     state: State<'_, Workspace>,
@@ -153,6 +164,27 @@
 //!     let project = analysis_snapshot(&state, project_id, revision)?;
 //!     tauri::async_runtime::spawn_blocking(move || {
 //!         studiocut_ai::ai_gaps::reframe_motion_clip(&project, clip_id, &target, at_seconds)
+//!     })
+//!     .await
+//!     .map_err(|e| e.to_string())?
+//! }
+//!
+//! /// Face-tracked reframe plan for a portrait/square target: the crop
+//! /// centre follows the one face detected consistently across the clip
+//! /// (see ai_gaps::reframe_face_track_clip). When no face is found
+//! /// consistently, the plan falls back to the motion-weighted reframe
+//! /// and says so.
+//! #[tauri::command]
+//! async fn reframe_face_track(
+//!     state: State<'_, Workspace>,
+//!     project_id: uuid::Uuid,
+//!     revision: u64,
+//!     clip_id: uuid::Uuid,
+//!     target: String,
+//! ) -> Result<studiocut_ai::ai_gaps::ReframePlan, String> {
+//!     let project = analysis_snapshot(&state, project_id, revision)?;
+//!     tauri::async_runtime::spawn_blocking(move || {
+//!         studiocut_ai::ai_gaps::reframe_face_track_clip(&project, clip_id, &target)
 //!     })
 //!     .await
 //!     .map_err(|e| e.to_string())?
@@ -180,6 +212,7 @@
 //! detect_beats,
 //! reframe_clip,
 //! reframe_motion_clip,
+//! reframe_face_track,
 //! diarization_capability,
 //! reframe_capability
 //! ```
@@ -205,11 +238,15 @@
 //!   target: '9:16',
 //!   atSeconds: 0,
 //! });
+//! const facePlan = await invoke<ReframePlan>('reframe_face_track', {
+//!   ...snapshot,
+//!   target: '9:16',
+//! });
 //! const diarization = await invoke<DiarizationCapability>('diarization_capability');
 //! const reframe = await invoke<ReframeCapability>('reframe_capability');
 //! ```
 
-use crate::{analysis, media, scopes, transcription, Project};
+use crate::{analysis, face, media, scopes, transcription, Project};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, time::Duration};
 use uuid::Uuid;
@@ -221,6 +258,10 @@ pub const METHOD_CENTRE_CROP: &str = "centre-crop";
 /// Method label for motion-weighted reframes (no face detection: the
 /// crop follows the highest-motion region, not a detected subject).
 pub const METHOD_MOTION_WEIGHTED: &str = "motion-weighted";
+/// Method label for face-tracked reframes: the crop centre follows
+/// the one face detected consistently across the clip (see
+/// [`reframe_face_track_clip`]).
+pub const METHOD_FACE_TRACKED: &str = "face-tracked";
 /// Minimum turn confidence for a speaker label to be reported.
 /// Below this threshold the turn's `speaker` is `null` ("unknown
 /// speaker") rather than an invented label.
@@ -887,15 +928,37 @@ pub struct CropRect {
     pub height: u32,
 }
 
+/// One keyframe of a face-tracked reframe plan: at `t_seconds` into
+/// the clip the crop is centred on (`focus_x`, `focus_y`) in
+/// normalised frame coordinates. Shared with the export filtergraph,
+/// which turns these keyframes into a time-varying crop expression
+/// (see [`crate::filtergraph::ExportSettings::face_tracks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReframeKeyframe {
+    pub t_seconds: f64,
+    pub focus_x: f64,
+    pub focus_y: f64,
+}
+
 /// Result of [`reframe_crop`] / [`reframe_clip`] /
-/// [`reframe_motion_clip`]. `method` is `"centre-crop"` for a geometric
-/// crop or `"motion-weighted"` for a crop centred on the
-/// highest-motion region (see [`reframe_motion_clip`]); it is never a
-/// face-tracking method in this build. `motion_confidence` is the
-/// share of frame-to-frame motion in the chosen region (0–1) for
-/// motion-weighted plans and `None` for centre crops. `ffmpeg_filter`
-/// is a ready-to-use FFmpeg `crop` filter for the source (e.g.
-/// `"crop=606:1080:656:0"`).
+/// [`reframe_motion_clip`] / [`reframe_face_track_clip`]. `method` is
+/// `"centre-crop"` for a geometric crop, `"motion-weighted"` for a
+/// crop centred on the highest-motion region (see
+/// [`reframe_motion_clip`]), or `"face-tracked"` for a crop whose
+/// centre follows a detected face over time (see
+/// [`reframe_face_track_clip`]). `motion_confidence` is the share of
+/// frame-to-frame motion in the chosen region (0–1) for
+/// motion-weighted plans and `None` otherwise. For face-tracked
+/// plans, `keyframes` holds the smoothed face track (one focus point
+/// per sampled frame) and `face_confidence` is the mean detection
+/// score across the track (0–1); both are empty / `None` for other
+/// methods. `ffmpeg_filter` is a ready-to-use FFmpeg `crop` filter
+/// for the source (e.g. `"crop=606:1080:656:0"`); for face-tracked
+/// plans it is the static crop at the first keyframe — the
+/// time-varying crop lives in the keyframes and is applied on export.
+/// Both new fields default on deserialization, so plans written
+/// before this feature still load.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReframePlan {
@@ -906,13 +969,19 @@ pub struct ReframePlan {
     pub crop: CropRect,
     pub ffmpeg_filter: String,
     pub motion_confidence: Option<f64>,
+    #[serde(default)]
+    pub keyframes: Vec<ReframeKeyframe>,
+    #[serde(default)]
+    pub face_confidence: Option<f64>,
     pub note: String,
 }
 
 /// What auto-reframe can and cannot do. `face_tracking_available` is
-/// `false`: no face-detection model is bundled with StudioCut AI.
-/// `motion_reframe_available` is `true`: a motion-weighted reframe
-/// (highest-motion region, centre-crop fallback) is available instead.
+/// `true` when the bundled BlazeFace model is present and loads (see
+/// [`crate::face`]); `motion_reframe_available` is `true`: a
+/// motion-weighted reframe (highest-motion region, centre-crop
+/// fallback) is available as well, and is the fallback when no face
+/// is found consistently.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReframeCapability {
@@ -923,12 +992,25 @@ pub struct ReframeCapability {
 }
 
 pub fn reframe_capability() -> ReframeCapability {
-    ReframeCapability {
-        face_tracking_available: false,
-        motion_reframe_available: true,
-        method: METHOD_CENTRE_CROP.into(),
-        note: "No face-detection model is bundled with StudioCut AI (no ONNX, Caffe, or GGML face model is present in the repository), so face tracking is unavailable. A motion-weighted reframe is available instead: it centres the crop on the highest-motion region at the playhead and falls back to a centre crop when the frames are effectively static; motion is a proxy for the subject, not subject detection. See reframe_motion_clip."
-            .into(),
+    if face::model_available() {
+        ReframeCapability {
+            face_tracking_available: true,
+            motion_reframe_available: true,
+            method: METHOD_FACE_TRACKED.into(),
+            note: "Face tracking is available: the bundled BlazeFace full-range model (Apache-2.0, converted in-house to ONNX, see assets/face-detection/README.md) detects faces under tract on the CPU. See reframe_face_track. When no face is found consistently across the clip, the plan falls back to the motion-weighted reframe and says so."
+                .into(),
+        }
+    } else {
+        ReframeCapability {
+            face_tracking_available: false,
+            motion_reframe_available: true,
+            method: METHOD_CENTRE_CROP.into(),
+            note: format!(
+                "Face tracking is unavailable: the bundled BlazeFace model failed to load ({}). A motion-weighted reframe is available instead: it centres the crop on the highest-motion region at the playhead and falls back to a centre crop when the frames are effectively static; motion is a proxy for the subject, not subject detection. See reframe_motion_clip.",
+                face::model_load_error()
+                    .unwrap_or_else(|| "unknown load error".into())
+            ),
+        }
     }
 }
 
@@ -943,9 +1025,10 @@ fn even_down(value: u32) -> u32 {
 ///
 /// `focus_x` / `focus_y` are normalised frame coordinates (0–1); when
 /// given, the crop window is centred on the focus point as far as the
-/// frame allows. No face is detected: a focus point is only a hint the
-/// caller supplies (for example from a future face tracker). When the
-/// source already matches the target aspect ratio, the crop is the full
+/// frame allows. No face is detected by this function itself: a focus
+/// point is only a hint the caller supplies (for example from the
+/// face tracker in [`reframe_face_track_clip`]). When the source
+/// already matches the target aspect ratio, the crop is the full
 /// frame.
 pub fn reframe_crop(
     source_width: u32,
@@ -1016,7 +1099,9 @@ pub fn reframe_crop(
             crop.width, crop.height, crop.x, crop.y
         ),
         motion_confidence: None,
-        note: "Centre crop — face tracking unavailable. No face-detection model is bundled with StudioCut AI, so no face is detected or tracked; the crop is centred on the frame (or on the supplied focus point). Supply a focus point from a future face tracker to re-centre the crop."
+        keyframes: vec![],
+        face_confidence: None,
+        note: "Centre crop — no face is detected by this crop itself. Face tracking is available separately (see reframe_face_track): the crop here is centred on the frame (or on the supplied focus point)."
             .into(),
     })
 }
@@ -1179,9 +1264,10 @@ fn extract_sample_frame(
 /// `"motion-weighted"`). When the frames are effectively static, or
 /// the clip is too short for a frame pair, the plan falls back to the
 /// centre crop (method `"centre-crop"`) and the note says so. No face
-/// is detected or tracked in either case: motion is a proxy for the
+/// is detected or tracked by this plan: motion is a proxy for the
 /// subject, and a moving background can pull the crop away from a
-/// still subject.
+/// still subject. Face tracking is available separately (see
+/// [`reframe_face_track_clip`]).
 pub fn reframe_motion_clip(
     project: &Project,
     clip_id: Uuid,
@@ -1205,7 +1291,7 @@ pub fn reframe_motion_clip(
         at_seconds - MOTION_FRAME_GAP_SECS
     } else {
         let mut plan = reframe_crop(width, height, target, None, None)?;
-        plan.note = "Motion-weighted reframe fell back to a centre crop: the clip is too short for two frames 0.5 s apart, so no motion region could be identified. Face tracking is unavailable — no face-detection model is bundled with StudioCut AI — so no face is detected or tracked."
+        plan.note = "Motion-weighted reframe fell back to a centre crop: the clip is too short for two frames 0.5 s apart, so no motion region could be identified. No face is detected or tracked by this plan; face tracking is available separately (see reframe_face_track)."
             .into();
         return Ok(plan);
     };
@@ -1218,14 +1304,122 @@ pub fn reframe_motion_clip(
             plan.method = METHOD_MOTION_WEIGHTED.into();
             plan.motion_confidence = Some(confidence);
             plan.note = format!(
-                "Motion-weighted reframe — face tracking unavailable. No face-detection model is bundled with StudioCut AI, so no face is detected or tracked; the crop is centred on the highest-motion region between two frames {MOTION_FRAME_GAP_SECS} s apart (focus {focus_x:.2}, {focus_y:.2} of the frame, motion confidence {confidence:.2}). Motion is a proxy for the subject: a moving background can pull the crop away from a still subject."
+                "Motion-weighted reframe — no face is detected or tracked by this plan; face tracking is available separately (see reframe_face_track). The crop is centred on the highest-motion region between two frames {MOTION_FRAME_GAP_SECS} s apart (focus {focus_x:.2}, {focus_y:.2} of the frame, motion confidence {confidence:.2}). Motion is a proxy for the subject: a moving background can pull the crop away from a still subject."
             );
             Ok(plan)
         }
         None => {
             let mut plan = reframe_crop(width, height, target, None, None)?;
-            plan.note = "Motion-weighted reframe fell back to a centre crop: the two frames compared were effectively static, so no motion region could be identified. Face tracking is unavailable — no face-detection model is bundled with StudioCut AI — so no face is detected or tracked."
+            plan.note = "Motion-weighted reframe fell back to a centre crop: the two frames compared were effectively static, so no motion region could be identified. No face is detected or tracked by this plan; face tracking is available separately (see reframe_face_track)."
                 .into();
+            Ok(plan)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Face-tracked reframe (BlazeFace full-range under tract)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of frames sampled across the clip for face
+/// tracking. Eight samples bound the FFmpeg extraction and inference
+/// work while still covering the clip.
+pub const FACE_TRACK_MAX_SAMPLES: usize = 8;
+/// Nominal spacing between sampled frames, in seconds. Short clips
+/// yield fewer samples; long clips are spread evenly across the whole
+/// duration instead of clustering at the playhead.
+pub const FACE_TRACK_SAMPLE_GAP_SECS: f64 = 0.5;
+
+/// Face-tracked reframe plan for a clip in the open project: frames
+/// are sampled across the whole clip, the bundled BlazeFace model
+/// (see [`crate::face`]) runs on each sample, and the one face that
+/// appears consistently is tracked (method `"face-tracked"`). The
+/// plan's `keyframes` hold the smoothed track — one focus point per
+/// sampled frame, in normalised frame coordinates — and its `crop` /
+/// `ffmpeg_filter` is the static crop at the first keyframe; the
+/// time-varying crop is applied on export from the keyframes (see
+/// [`crate::filtergraph::ExportSettings::face_tracks`]).
+///
+/// When no face is found consistently, the plan falls back to the
+/// motion-weighted reframe at the clip start ([`reframe_motion_clip`])
+/// and the note says no face was tracked — it never claims a face was
+/// tracked when it was not. When the bundled model fails to load, an
+/// error is returned instead of a silent fallback, so the caller can
+/// report the real reason (see [`reframe_capability`]).
+pub fn reframe_face_track_clip(
+    project: &Project,
+    clip_id: Uuid,
+    target: &str,
+) -> Result<ReframePlan, String> {
+    let (asset, clip) = analysis::selected_video(project, clip_id)?;
+    let width = asset.width.ok_or("Selected clip has no video dimensions")?;
+    let height = asset
+        .height
+        .ok_or("Selected clip has no video dimensions")?;
+    if !face::model_available() {
+        return Err(format!(
+            "Face tracking is unavailable: the bundled BlazeFace model failed to load ({})",
+            face::model_load_error().unwrap_or_else(|| "unknown load error".into())
+        ));
+    }
+    let duration = clip.duration as f64 / project.settings.fps as f64;
+    if !(duration > 0.0) {
+        return Err("Selected clip has no duration".into());
+    }
+    let sample_count = ((duration / FACE_TRACK_SAMPLE_GAP_SECS).floor() as usize + 1)
+        .clamp(1, FACE_TRACK_MAX_SAMPLES);
+    let source_in = clip.source_in as f64 / project.settings.fps as f64;
+    let (sample_width, sample_height) = scopes::sample_dimensions(width, height, false);
+    let mut samples: Vec<face::FaceSample> = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let t_seconds = if sample_count == 1 {
+            0.0
+        } else {
+            duration * index as f64 / (sample_count - 1) as f64
+        };
+        let frame =
+            extract_sample_frame(asset, source_in + t_seconds, sample_width, sample_height)?;
+        let faces = face::detect_faces(&frame, sample_width, sample_height)?;
+        samples.push(face::FaceSample { t_seconds, faces });
+    }
+    let found_in = samples
+        .iter()
+        .filter(|sample| !sample.faces.is_empty())
+        .count();
+    match face::select_face_track(&samples) {
+        Some(track) => {
+            let first = track[0];
+            let mut plan = reframe_crop(
+                width,
+                height,
+                target,
+                Some(first.focus_x),
+                Some(first.focus_y),
+            )?;
+            plan.method = METHOD_FACE_TRACKED.into();
+            plan.keyframes = track
+                .iter()
+                .map(|point| ReframeKeyframe {
+                    t_seconds: round_ms(point.t_seconds),
+                    focus_x: round_ms(point.focus_x),
+                    focus_y: round_ms(point.focus_y),
+                })
+                .collect();
+            plan.face_confidence = Some(round_ms(
+                track.iter().map(|point| point.confidence).sum::<f64>() / track.len() as f64,
+            ));
+            plan.note = format!(
+                "Face-tracked reframe: one face was detected in {found_in} of {sample_count} sampled frames and tracked across the clip (mean face confidence {:.2}). The crop centre follows the smoothed track in the keyframes; the FFmpeg filter below is the static crop at the first keyframe, and export applies the time-varying crop from the track.",
+                plan.face_confidence.unwrap_or(0.0)
+            );
+            Ok(plan)
+        }
+        None => {
+            let mut plan = reframe_motion_clip(project, clip_id, target, 0.0)?;
+            plan.note = format!(
+                "No face was detected consistently in {sample_count} sampled frames ({found_in} had any face), so this plan falls back to the motion-weighted reframe. {}",
+                plan.note
+            );
             Ok(plan)
         }
     }
