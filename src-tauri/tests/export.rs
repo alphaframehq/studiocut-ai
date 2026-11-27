@@ -10,7 +10,7 @@ use studiocut_ai::{
     edl::{Effects, Lut},
     filtergraph::{compile, ExportSettings},
     finishing::{preset, validate_cube, Finishing, TransformKey},
-    media::import_media,
+    media::{ffmpeg_path, ffprobe_path, import_media},
     render::{parse_progress, ExportManager, Snapshot},
     timeline::{Clip, Track},
 };
@@ -26,7 +26,7 @@ fn settings() -> ExportSettings {
 }
 fn fixture(root: &Path) -> studiocut_ai::Project {
     let source = root.join("source ' [clip].mp4");
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -487,7 +487,7 @@ fn vertical_settings(fill: &str) -> ExportSettings {
 }
 
 fn probe_dimensions(path: &Path) -> (u32, u32) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(ffprobe_path())
         .args([
             "-v",
             "error",
