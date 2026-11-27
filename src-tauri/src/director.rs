@@ -1,8 +1,9 @@
 use crate::{
     agents::{EdlDiff, GradeSuggestion, QaDrop},
+    analysis::Scene,
     credentials::{Credentials, Provider},
     edl::{self, Edl},
-    Project,
+    thumbnail, Project,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -150,9 +151,42 @@ pub fn parse_proposal_response(text: &str) -> Result<(Edl, Option<Plan>), String
 pub struct DirectorListedModel {
     pub id: String,
     pub recommended: bool,
+    /// Whether the Director may send footage frames to this model.
+    /// Vision is offered only for providers and models where image
+    /// input is known to be supported; unknown capability means no
+    /// frames are sent. Defaults to false for older cached entries.
+    #[serde(default)]
+    pub vision: bool,
     /// Why this entry is here when it did not come from a live list
     /// (static Claude/Bedrock lists). `None` for fetched models.
     pub note: Option<String>,
+}
+
+/// Maximum footage frames attached to one Director request, and the
+/// per-image size cap. Frames reuse the thumbnail path, which already
+/// enforces the 500 KB limit per image.
+pub const MAX_VISION_FRAMES: usize = 6;
+pub const MAX_VISION_IMAGE_BYTES: u64 = 500_000;
+
+/// Model-id prefixes known to accept image input on OpenAI. Kept
+/// deliberately narrow: an unlisted model is treated as not
+/// vision-capable and receives metadata only.
+const OPENAI_VISION_PREFIXES: [&str; 5] =
+    ["gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "chatgpt-4o"];
+
+/// Whether the Director may send footage frames to this provider and
+/// model. Only OpenAI and Gemini vision-capable models qualify.
+/// Every other provider, and any model whose capability is unknown,
+/// returns false, which keeps the metadata-only path.
+pub fn model_supports_vision(provider: Provider, model: &str) -> bool {
+    let lower = model.trim().to_lowercase();
+    match provider {
+        Provider::Openai => OPENAI_VISION_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix)),
+        Provider::Gemini => lower.starts_with("gemini-") && !lower.contains("embedding"),
+        _ => false,
+    }
 }
 
 #[derive(Serialize)]
@@ -308,6 +342,19 @@ pub fn filter_director_models(value: &Value, provider: &str) -> Vec<DirectorList
                     if NON_CHAT_MARKERS.iter().any(|m| lower.contains(m)) {
                         return None;
                     }
+                    // Vision capability: OpenAI from the known-capable
+                    // model list; OpenRouter from the provider-reported
+                    // input modalities ("image" in). Any other provider
+                    // or unknown capability means no frames are sent.
+                    let vision = if provider == "openrouter" {
+                        item.pointer("/architecture/input_modalities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|m| m.iter().any(|v| v.as_str() == Some("image")))
+                    } else if provider == "openai" {
+                        model_supports_vision(Provider::Openai, &id)
+                    } else {
+                        false
+                    };
                     if provider == "openrouter" {
                         let modality = item
                             .pointer("/architecture/modality")
@@ -328,6 +375,7 @@ pub fn filter_director_models(value: &Value, provider: &str) -> Vec<DirectorList
                     }
                     Some(DirectorListedModel {
                         recommended: RECOMMENDED_DIRECTOR_MODELS.contains(&id.as_str()),
+                        vision,
                         id,
                         note: None,
                     })
@@ -364,6 +412,7 @@ pub fn filter_gemini_models(value: &Value) -> Vec<DirectorListedModel> {
                     }
                     Some(DirectorListedModel {
                         recommended: RECOMMENDED_DIRECTOR_MODELS.contains(&id.as_str()),
+                        vision: model_supports_vision(Provider::Gemini, &id),
                         id,
                         note: None,
                     })
@@ -390,8 +439,11 @@ pub fn filter_ollama_models(value: &Value) -> Vec<DirectorListedModel> {
                     if NON_CHAT_MARKERS.iter().any(|m| lower.contains(m)) {
                         return None;
                     }
+                    // Local Ollama models report no vision capability,
+                    // so frames are never sent to them.
                     Some(DirectorListedModel {
                         recommended: false,
+                        vision: false,
                         id,
                         note: None,
                     })
@@ -409,6 +461,9 @@ fn static_models(ids: &[&str], note: &str) -> Vec<DirectorListedModel> {
         .map(|id| DirectorListedModel {
             id: id.to_string(),
             recommended: RECOMMENDED_DIRECTOR_MODELS.contains(id),
+            // Static lists carry no capability metadata, and vision is
+            // offered only for OpenAI and Gemini models this round.
+            vision: false,
             note: Some(note.to_string()),
         })
         .collect()
@@ -504,6 +559,309 @@ pub fn list_director_models(
     Ok(DirectorModelsResponse { models, note: None })
 }
 
+/// What the frontend asks the Director to see: an opt-in plus optional
+/// scene boundaries for one clip, from a prior scene-detection run.
+/// Scenes are clip-relative seconds, matching [`Scene`].
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VisionRequest {
+    /// Send footage frames when the selected model supports vision.
+    /// False keeps the metadata-only path.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Clip the supplied scenes belong to. Ignored without scenes.
+    #[serde(default)]
+    pub clip_id: Option<uuid::Uuid>,
+    /// Scene boundaries for `clip_id`. Empty means evenly spaced frames.
+    #[serde(default)]
+    pub scenes: Vec<Scene>,
+}
+
+/// One frame the Director will send: its clip and clip-relative time.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VisionFramePlan {
+    pub clip_id: uuid::Uuid,
+    pub at_seconds: f64,
+}
+
+/// An extracted frame, ready to attach to a provider request. The data
+/// URL is a PNG of at most 500 KB, produced by the thumbnail path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisionFrame {
+    pub clip_id: uuid::Uuid,
+    pub at_seconds: f64,
+    pub data_url: String,
+}
+
+/// Preview of a vision request: whether frames would be sent and which
+/// frames, without extracting anything or calling a provider.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionPreview {
+    pub supported: bool,
+    pub frames: Vec<VisionFramePlan>,
+    pub note: String,
+}
+
+/// The video clip with this id and its asset, if it exists and has video.
+/// Caption tracks never count: they carry no footage of their own.
+fn video_clip<'a>(
+    project: &'a Project,
+    clip_id: uuid::Uuid,
+) -> Option<(&'a crate::timeline::Clip, &'a crate::media::Asset)> {
+    let clip = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind != "caption")
+        .flat_map(|t| &t.clips)
+        .find(|c| c.id == clip_id)?;
+    let asset = project.assets.iter().find(|a| a.id == clip.asset_id)?;
+    if asset.video_stream.is_none() || clip.duration == 0 {
+        return None;
+    }
+    Some((clip, asset))
+}
+
+/// Pick up to `max_frames` frame times (seconds) inside a clip of
+/// `duration_secs`. With usable scene boundaries, one frame is taken
+/// shortly after each scene start, evenly subsampled when scenes
+/// outnumber the cap. Without scenes, frames are evenly spaced across
+/// the clip. Every returned time is inside the clip.
+pub fn select_vision_times(duration_secs: f64, scenes: &[Scene], max_frames: usize) -> Vec<f64> {
+    if !duration_secs.is_finite() || duration_secs <= 0.0 || max_frames == 0 {
+        return vec![];
+    }
+    let mut starts: Vec<f64> = scenes
+        .iter()
+        .filter(|s| {
+            s.start.is_finite() && s.start >= 0.0 && s.start < duration_secs && s.end > s.start
+        })
+        .map(|s| s.start)
+        .collect();
+    starts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    starts.dedup_by(|a, b| (*a - *b).abs() < 0.25);
+    let mut times: Vec<f64> = if starts.is_empty() {
+        (0..max_frames)
+            .map(|i| (i as f64 + 0.5) * duration_secs / max_frames as f64)
+            .collect()
+    } else {
+        starts
+            .iter()
+            .map(|start| {
+                let offset = scenes
+                    .iter()
+                    .find(|s| (s.start - *start).abs() < 0.25)
+                    .map(|s| ((s.end - s.start) * 0.25).min(0.5))
+                    .unwrap_or(0.0);
+                (start + offset).min(duration_secs - 0.05).max(0.0)
+            })
+            .collect()
+    };
+    if times.len() > max_frames {
+        if max_frames == 1 {
+            times.truncate(1);
+        } else {
+            // Evenly subsample, always keeping the first and last scene.
+            times = (0..max_frames)
+                .map(|i| times[(i * (times.len() - 1)) / (max_frames - 1)])
+                .collect();
+        }
+    }
+    times
+}
+
+/// Plan which frames a vision request would send, without extracting
+/// them. Scene boundaries win when they name a video clip in this
+/// project; otherwise frames are evenly spaced across all video in
+/// timeline order, capped at [`MAX_VISION_FRAMES`].
+pub fn plan_vision_frames(project: &Project, vision: &VisionRequest) -> Vec<VisionFramePlan> {
+    if !vision.enabled {
+        return vec![];
+    }
+    let fps = project.settings.fps as f64;
+    if fps <= 0.0 {
+        return vec![];
+    }
+    // Scene-boundary frames for the named clip, when usable.
+    if let Some(clip_id) = vision.clip_id {
+        if !vision.scenes.is_empty() {
+            if let Some((clip, _asset)) = video_clip(project, clip_id) {
+                let duration = clip.duration as f64 / fps;
+                return select_vision_times(duration, &vision.scenes, MAX_VISION_FRAMES)
+                    .into_iter()
+                    .map(|at_seconds| VisionFramePlan {
+                        clip_id,
+                        at_seconds,
+                    })
+                    .collect();
+            }
+        }
+    }
+    // Evenly spaced across every video clip, in timeline order.
+    // Only video tracks count: a linked audio half references the
+    // same asset, and counting it would double the timeline length.
+    let clips: Vec<(uuid::Uuid, f64)> = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == "video")
+        .flat_map(|t| &t.clips)
+        .filter_map(|clip| {
+            let asset = project.assets.iter().find(|a| a.id == clip.asset_id)?;
+            if asset.video_stream.is_none() || clip.duration == 0 {
+                return None;
+            }
+            Some((clip.id, clip.duration as f64 / fps))
+        })
+        .collect();
+    let total: f64 = clips.iter().map(|(_, duration)| *duration).sum();
+    if total <= 0.0 {
+        return vec![];
+    }
+    let mut plans = Vec::new();
+    for i in 0..MAX_VISION_FRAMES {
+        let target = (i as f64 + 0.5) * total / MAX_VISION_FRAMES as f64;
+        let mut start = 0.0;
+        for (clip_id, duration) in &clips {
+            if target < start + *duration {
+                let at_seconds = (target - start).min(duration - 0.05).max(0.0);
+                plans.push(VisionFramePlan {
+                    clip_id: *clip_id,
+                    at_seconds,
+                });
+                break;
+            }
+            start += *duration;
+        }
+    }
+    plans
+}
+
+/// Extract the planned frames through the thumbnail path (one ffmpeg
+/// grab per frame, 500 KB cap each). A frame that fails to extract is
+/// skipped, never fatal: the proposal falls back to the frames that
+/// did extract, or to metadata only when none did.
+pub fn extract_vision_frames(project: &Project, plan: &[VisionFramePlan]) -> Vec<VisionFrame> {
+    plan.iter()
+        .filter_map(|entry| {
+            thumbnail::extract_thumbnail(project, entry.clip_id, entry.at_seconds)
+                .ok()
+                .map(|data_url| VisionFrame {
+                    clip_id: entry.clip_id,
+                    at_seconds: entry.at_seconds,
+                    data_url,
+                })
+        })
+        .collect()
+}
+
+/// Describe a vision request without extracting frames or calling a
+/// provider: whether this model supports vision and which frames
+/// would be sent. Used by the preview command and by [`Director::propose`].
+pub fn vision_preview(project: &Project, config: &Config, vision: &VisionRequest) -> VisionPreview {
+    let supported = model_supports_vision(config.provider, &config.model);
+    if !vision.enabled {
+        return VisionPreview {
+            supported,
+            frames: vec![],
+            note: "Vision frames are off for this proposal; it uses project metadata only.".into(),
+        };
+    }
+    if !supported {
+        return VisionPreview {
+            supported,
+            frames: vec![],
+            note: "Metadata only: the selected model does not support vision, so no video frames are sent."
+                .into(),
+        };
+    }
+    let frames = plan_vision_frames(project, vision);
+    if frames.is_empty() {
+        return VisionPreview {
+            supported,
+            frames,
+            note: "Metadata only: no video frames could be found in this project.".into(),
+        };
+    }
+    VisionPreview {
+        supported,
+        frames: frames.clone(),
+        note: format!(
+            "{} video frame{} from the footage will be sent with this proposal.",
+            frames.len(),
+            if frames.len() == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+/// Attach extracted frames to an edit-proposal request body, in the
+/// shape each provider expects. OpenAI-compatible providers take
+/// `image_url` content parts; Gemini and Vertex take `inlineData`
+/// parts with the data-URL prefix stripped. Other providers keep the
+/// text-only body: vision is not offered for them.
+pub fn request_body_with_frames(config: &Config, prompt: &str, frames: &[VisionFrame]) -> Value {
+    if frames.is_empty() {
+        return request_body(config, prompt);
+    }
+    let mut body = request_body(config, prompt);
+    match config.provider {
+        Provider::Openai | Provider::Groq | Provider::Openrouter | Provider::Compatible => {
+            let mut content = vec![json!({"type": "text", "text": prompt})];
+            for frame in frames {
+                content.push(json!({"type": "image_url", "image_url": {"url": frame.data_url}}));
+            }
+            body["messages"][1]["content"] = Value::Array(content);
+        }
+        Provider::Gemini | Provider::Vertex => {
+            let mut parts = vec![json!({"text": prompt})];
+            for frame in frames {
+                let base64 = frame
+                    .data_url
+                    .strip_prefix("data:image/png;base64,")
+                    .unwrap_or(&frame.data_url);
+                parts.push(json!({"inlineData": {"mimeType": "image/png", "data": base64}}));
+            }
+            body["contents"][0]["parts"] = Value::Array(parts);
+        }
+        _ => {}
+    }
+    body
+}
+
+/// Copy a request body for the trace with vision image bytes replaced
+/// by a placeholder. The body actually sent keeps the frames; only
+/// the stored trace is redacted, so the review panel never renders
+/// megabytes of base64.
+pub fn redact_vision_body(body: &Value) -> Value {
+    const PLACEHOLDER: &str = "[vision frame omitted from trace]";
+    let mut redacted = body.clone();
+    if let Some(messages) = redacted.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if let Some(url) = part.pointer_mut("/image_url/url") {
+                        if url.as_str().is_some_and(|u| u.starts_with("data:image/")) {
+                            *url = Value::String(PLACEHOLDER.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(contents) = redacted.get_mut("contents").and_then(Value::as_array_mut) {
+        for content in contents {
+            if let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if let Some(data) = part.pointer_mut("/inlineData/data") {
+                        *data = Value::String(PLACEHOLDER.into());
+                    }
+                }
+            }
+        }
+    }
+    redacted
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Context {
@@ -563,6 +921,13 @@ pub struct Proposal {
     /// Caption preset picked from the plan's captions text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_preset: Option<String>,
+    /// Number of footage frames attached to the provider request.
+    /// Zero means the proposal used metadata only.
+    #[serde(default)]
+    pub vision_frames: usize,
+    /// What the Director could see for this proposal, shown in the panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_note: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -655,6 +1020,7 @@ impl Director {
         mode: &str,
         previous: Option<PreviousProposal>,
         learned_preferences: Option<String>,
+        vision: VisionRequest,
     ) -> Result<Proposal, String> {
         if self.0.swap(true, Ordering::AcqRel) {
             return Err("A Director request is already running".into());
@@ -686,10 +1052,41 @@ impl Director {
         }
         let prompt = prompt_value.to_string();
         let titles = mode == "titles";
+        // Vision: frames are extracted only after the provider key is
+        // confirmed above, only for vision-capable models, and only in
+        // edit mode. Titles stay text-only. Any extraction failure
+        // falls back to metadata only; the proposal never fails for
+        // a missing frame.
+        let supported = model_supports_vision(config.provider, &config.model);
+        let preview = vision_preview(project, &config, &vision);
+        let frames = if titles || !vision.enabled || !supported {
+            Vec::new()
+        } else {
+            extract_vision_frames(project, &preview.frames)
+        };
+        let vision_note = if titles {
+            None
+        } else if !vision.enabled {
+            Some("Metadata only: vision frames were not requested for this proposal.".to_string())
+        } else if !supported {
+            Some(
+                "Metadata only: the selected model does not support vision, so no video frames were sent."
+                    .to_string(),
+            )
+        } else if frames.is_empty() {
+            Some("Metadata only: no video frames could be extracted from this project.".to_string())
+        } else {
+            Some(format!(
+                "Included {} video frame{} from the footage in this proposal.",
+                frames.len(),
+                if frames.len() == 1 { "" } else { "s" }
+            ))
+        };
+        let vision_frames = frames.len();
         let body = if titles {
             titles_body(&config, &prompt)
         } else {
-            request_body(&config, &prompt)
+            request_body_with_frames(&config, &prompt, &frames)
         };
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(90))
@@ -741,7 +1138,7 @@ impl Director {
                 summary: "Titles & hooks".into(),
                 operations: vec![],
             };
-            return Ok(Proposal { edl, text: Some(text), plan: None, qa_dropped: vec![], diff: None, grade_suggestion: None, caption_preset: None, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:3, estimated_cost:None, request_body:body, tool_calls:vec![] } });
+            return Ok(Proposal { edl, text: Some(text), plan: None, qa_dropped: vec![], diff: None, grade_suggestion: None, caption_preset: None, vision_frames: 0, vision_note: None, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:3, estimated_cost:None, request_body:redact_vision_body(&body), tool_calls:vec![] } });
         }
         let (mut edl, plan) = parse_proposal_response(&text)?;
         // QA runs after parse, before compile, on the parsed EDL.
@@ -769,7 +1166,7 @@ impl Director {
         } else {
             edl::compile(project, &edl)?;
         }
-        Ok(Proposal { edl, text: None, plan, qa_dropped, diff, grade_suggestion, caption_preset, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:3, estimated_cost:None, request_body:body, tool_calls:vec![] } })
+        Ok(Proposal { edl, text: None, plan, qa_dropped, diff, grade_suggestion, caption_preset, vision_frames, vision_note, trace: Trace { request_id: uuid::Uuid::new_v4().to_string(), provider:config.provider, model:config.model, latency_ms:started.elapsed().as_millis(), context_bytes:context.bytes, usage:value.get("usage").or_else(|| value.get("usageMetadata")).cloned().unwrap_or_else(|| json!({"inputTokens":value.get("prompt_eval_count"),"outputTokens":value.get("eval_count")})), prompt_version:3, estimated_cost:None, request_body:redact_vision_body(&body), tool_calls:vec![] } })
     }
 }
 
@@ -948,5 +1345,243 @@ mod tests {
         assert!(body.to_string().contains("title and hook writer"));
         let edit = request_body(&config, "prompt");
         assert!(edit.to_string().contains("baseRevision"));
+    }
+    #[test]
+    fn vision_capability_is_openai_and_gemini_only_and_defaults_to_no() {
+        assert!(model_supports_vision(Provider::Openai, "gpt-4o"));
+        assert!(model_supports_vision(Provider::Openai, "gpt-4o-mini"));
+        assert!(model_supports_vision(Provider::Openai, "gpt-4.1"));
+        assert!(model_supports_vision(Provider::Openai, "gpt-5"));
+        assert!(model_supports_vision(Provider::Openai, "chatgpt-4o-latest"));
+        assert!(!model_supports_vision(Provider::Openai, "gpt-3.5-turbo"));
+        assert!(!model_supports_vision(Provider::Openai, "o1-preview"));
+        assert!(!model_supports_vision(
+            Provider::Openai,
+            "text-embedding-3-small"
+        ));
+        assert!(model_supports_vision(Provider::Gemini, "gemini-2.5-flash"));
+        assert!(model_supports_vision(Provider::Gemini, "gemini-2.0-flash"));
+        assert!(model_supports_vision(Provider::Gemini, "gemini-1.5-pro"));
+        assert!(!model_supports_vision(
+            Provider::Gemini,
+            "gemini-embedding-001"
+        ));
+        assert!(!model_supports_vision(Provider::Gemini, ""));
+        for provider in [
+            Provider::Claude,
+            Provider::Groq,
+            Provider::Openrouter,
+            Provider::Compatible,
+            Provider::Ollama,
+            Provider::Bedrock,
+            Provider::Vertex,
+        ] {
+            assert!(!model_supports_vision(provider, "gpt-4o"));
+            assert!(!model_supports_vision(provider, "gemini-2.5-flash"));
+        }
+        assert!(!model_supports_vision(
+            Provider::Openai,
+            "some-future-model"
+        ));
+    }
+    #[test]
+    fn vision_flag_comes_from_model_metadata_and_static_lists_have_none() {
+        let openai = json!({"data":[
+            {"id":"gpt-4o"},
+            {"id":"gpt-3.5-turbo"},
+        ]});
+        let models = filter_director_models(&openai, "openai");
+        assert!(models.iter().find(|m| m.id == "gpt-4o").unwrap().vision);
+        assert!(
+            !models
+                .iter()
+                .find(|m| m.id == "gpt-3.5-turbo")
+                .unwrap()
+                .vision
+        );
+        let gemini = json!({"models":[
+            {"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]},
+        ]});
+        assert!(filter_gemini_models(&gemini)[0].vision);
+        let openrouter = json!({"data":[
+            {"id":"openai/gpt-4o","architecture":{"modality":"text->text","input_modalities":["text","image"]}},
+            {"id":"meta-llama/llama-3.3-70b-instruct","architecture":{"modality":"text->text","input_modalities":["text"]}},
+        ]});
+        let models = filter_director_models(&openrouter, "openrouter");
+        assert!(
+            models
+                .iter()
+                .find(|m| m.id == "openai/gpt-4o")
+                .unwrap()
+                .vision
+        );
+        assert!(
+            !models
+                .iter()
+                .find(|m| m.id == "meta-llama/llama-3.3-70b-instruct")
+                .unwrap()
+                .vision
+        );
+        let ollama = json!({"models":[{"name":"llama3.3:70b"}]});
+        assert!(!filter_ollama_models(&ollama)[0].vision);
+        let claude = list_director_models(&DirectorModelsRequest {
+            provider: "claude".into(),
+            api_key: "".into(),
+            endpoint: "".into(),
+        })
+        .unwrap();
+        assert!(claude.models.iter().all(|m| !m.vision));
+    }
+    #[test]
+    fn select_vision_times_uses_scene_boundaries_then_even_spacing() {
+        let scenes = vec![
+            Scene {
+                start: 0.0,
+                end: 2.0,
+                score: None,
+            },
+            Scene {
+                start: 2.0,
+                end: 5.0,
+                score: None,
+            },
+            Scene {
+                start: 5.0,
+                end: 9.0,
+                score: None,
+            },
+        ];
+        let times = select_vision_times(10.0, &scenes, 6);
+        assert_eq!(times.len(), 3);
+        // Shortly after each scene start, never on the boundary frame.
+        assert!((times[0] - 0.5).abs() < 1e-9);
+        assert!((times[1] - 2.5).abs() < 1e-9);
+        assert!((times[2] - 5.5).abs() < 1e-9);
+        // No scenes: evenly spaced across the clip.
+        let even = select_vision_times(12.0, &[], 6);
+        assert_eq!(even.len(), 6);
+        assert!((even[0] - 1.0).abs() < 1e-9);
+        assert!((even[5] - 11.0).abs() < 1e-9);
+        // More scenes than the cap: subsampled to the cap, keeping the
+        // first and last scene.
+        let many: Vec<Scene> = (0..10)
+            .map(|i| Scene {
+                start: i as f64,
+                end: i as f64 + 1.0,
+                score: None,
+            })
+            .collect();
+        let capped = select_vision_times(10.0, &many, 6);
+        assert_eq!(capped.len(), 6);
+        assert!((capped[0] - 0.25).abs() < 1e-9);
+        assert!((capped[5] - 9.25).abs() < 1e-9);
+        // Invalid scenes and bad durations fall back to even spacing
+        // or to no frames at all.
+        let invalid = vec![Scene {
+            start: 99.0,
+            end: 100.0,
+            score: None,
+        }];
+        assert_eq!(select_vision_times(10.0, &invalid, 6).len(), 6);
+        assert!(select_vision_times(0.0, &[], 6).is_empty());
+        assert!(select_vision_times(10.0, &[], 0).is_empty());
+        assert!(select_vision_times(f64::NAN, &[], 6).is_empty());
+    }
+    #[test]
+    fn request_body_with_frames_shapes_each_provider_and_empty_means_text_only() {
+        let frame = VisionFrame {
+            clip_id: uuid::Uuid::new_v4(),
+            at_seconds: 1.0,
+            data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+        };
+        let frames = vec![frame];
+        let openai = Config {
+            provider: Provider::Openai,
+            model: "gpt-4o".into(),
+            endpoint: "".into(),
+            max_tokens: 512,
+        };
+        let body = request_body_with_frames(&openai, "prompt", &frames);
+        let content = &body["messages"][1]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "prompt");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        assert!(body.to_string().contains("baseRevision"));
+        let gemini = Config {
+            provider: Provider::Gemini,
+            model: "gemini-2.5-flash".into(),
+            endpoint: "".into(),
+            max_tokens: 512,
+        };
+        let body = request_body_with_frames(&gemini, "prompt", &frames);
+        let parts = &body["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "prompt");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "iVBORw0KGgo=");
+        assert!(!body.to_string().contains("data:image/png"));
+        // No frames: identical to the text-only body.
+        assert_eq!(
+            request_body_with_frames(&openai, "prompt", &[]),
+            request_body(&openai, "prompt")
+        );
+        // Claude keeps the text-only body even if frames are supplied.
+        let claude = Config {
+            provider: Provider::Claude,
+            model: "claude-sonnet-4-5".into(),
+            endpoint: "".into(),
+            max_tokens: 512,
+        };
+        assert_eq!(
+            request_body_with_frames(&claude, "prompt", &frames),
+            request_body(&claude, "prompt")
+        );
+    }
+    #[test]
+    fn redact_vision_body_removes_image_bytes_but_keeps_text() {
+        let frame = VisionFrame {
+            clip_id: uuid::Uuid::new_v4(),
+            at_seconds: 1.0,
+            data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+        };
+        let config = Config {
+            provider: Provider::Openai,
+            model: "gpt-4o".into(),
+            endpoint: "".into(),
+            max_tokens: 512,
+        };
+        let body = request_body_with_frames(&config, "prompt", &[frame]);
+        let redacted = redact_vision_body(&body);
+        assert!(!redacted.to_string().contains("iVBORw0KGgo="));
+        assert!(redacted
+            .to_string()
+            .contains("vision frame omitted from trace"));
+        assert!(redacted.to_string().contains("prompt"));
+        let gemini = Config {
+            provider: Provider::Gemini,
+            model: "gemini-2.5-flash".into(),
+            endpoint: "".into(),
+            max_tokens: 512,
+        };
+        let frame = VisionFrame {
+            clip_id: uuid::Uuid::new_v4(),
+            at_seconds: 1.0,
+            data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+        };
+        let body = request_body_with_frames(&gemini, "prompt", &[frame]);
+        let redacted = redact_vision_body(&body);
+        assert!(!redacted.to_string().contains("iVBORw0KGgo="));
+        assert!(redacted.to_string().contains("prompt"));
+    }
+    #[test]
+    fn vision_request_defaults_to_metadata_only() {
+        let vision = VisionRequest::default();
+        assert!(!vision.enabled);
+        assert!(vision.clip_id.is_none());
+        assert!(vision.scenes.is_empty());
     }
 }
