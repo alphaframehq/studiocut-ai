@@ -1,0 +1,224 @@
+# StudioCut AI — Release
+# Builds Tauri installers for Windows, macOS and Linux from a version
+# tag, bundles the prebuilt static FFmpeg sidecars, and publishes a GitHub
+# Release with the installers and the updater artifacts (latest.json and the
+# .sig files). The app itself is not code-signed: no signing identity is
+# configured anywhere in this workflow, so the installers ship unsigned.
+# Only the Tauri updater payload is signed, with the private key stored as
+# the TAURI_SIGNING_PRIVATE_KEY repository secret (the key has no password,
+# so no TAURI_SIGNING_PRIVATE_KEY_PASSWORD is set).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            sidecar_os: windows
+          - os: macos-latest
+            sidecar_os: macos
+          - os: ubuntu-22.04
+            sidecar_os: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same Linux system libraries as .github/workflows/ci.yml, plus FFmpeg
+      # itself: the Rust tests run real FFmpeg exports (Linux leg only).
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - run: npm ci
+
+      # The Rust tests only run on the Linux leg, matching CI. Windows and
+      # macOS skip them so no extra FFmpeg package install is needed there.
+      - name: Rust tests
+        if: runner.os == 'Linux'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast
+        timeout-minutes: 30
+
+      # --- FFmpeg sidecars -------------------------------------------------
+      # Downloaded at build time into src-tauri/binaries/ with the exact
+      # target-triple names Tauri expects for externalBin
+      # ("binaries/ffmpeg" and "binaries/ffprobe"). Nothing is committed to
+      # the repository; the workflow fetches the archives on every run.
+      #
+      # Windows and Linux use the LGPL static builds from FFmpeg-Builds
+      # (BtbN): https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases
+      # macOS uses the static builds from osxexperts.net, which publishes a
+      # separate archive per architecture. evermeet was checked and not
+      # used: its published configure line includes --enable-gpl (so it is a
+      # GPL build, not LGPL), it only ships Intel binaries, and its
+      # downloads return 403 without a browser User-Agent.
+      - name: Download FFmpeg sidecars (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip' -OutFile "$env:TEMP/ffmpeg-win64-lgpl.zip"
+          Expand-Archive -Path "$env:TEMP/ffmpeg-win64-lgpl.zip" -DestinationPath "$env:TEMP/ffmpeg-win64" -Force
+          Copy-Item "$env:TEMP/ffmpeg-win64/*/bin/ffmpeg.exe" 'src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe'
+          Copy-Item "$env:TEMP/ffmpeg-win64/*/bin/ffprobe.exe" 'src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe'
+          Get-ChildItem src-tauri/binaries
+
+      - name: Download FFmpeg sidecars (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/binaries
+          cd "$(mktemp -d)"
+          curl -fsSL -o ffmpeg-arm.zip https://www.osxexperts.net/ffmpeg91arm.zip
+          curl -fsSL -o ffprobe-arm.zip https://www.osxexperts.net/ffprobe91arm.zip
+          curl -fsSL -o ffmpeg-intel.zip https://www.osxexperts.net/ffmpeg80intel.zip
+          curl -fsSL -o ffprobe-intel.zip https://www.osxexperts.net/ffprobe80intel.zip
+          unzip -o -q ffmpeg-arm.zip -d arm-ffmpeg
+          unzip -o -q ffprobe-arm.zip -d arm-ffprobe
+          unzip -o -q ffmpeg-intel.zip -d intel-ffmpeg
+          unzip -o -q ffprobe-intel.zip -d intel-ffprobe
+          cp "$(find arm-ffmpeg -name 'ffmpeg*' -type f | head -n 1)" "$GITHUB_WORKSPACE/src-tauri/binaries/ffmpeg-aarch64-apple-darwin"
+          cp "$(find arm-ffprobe -name 'ffprobe*' -type f | head -n 1)" "$GITHUB_WORKSPACE/src-tauri/binaries/ffprobe-aarch64-apple-darwin"
+          cp "$(find intel-ffmpeg -name 'ffmpeg*' -type f | head -n 1)" "$GITHUB_WORKSPACE/src-tauri/binaries/ffmpeg-x86_64-apple-darwin"
+          cp "$(find intel-ffprobe -name 'ffprobe*' -type f | head -n 1)" "$GITHUB_WORKSPACE/src-tauri/binaries/ffprobe-x86_64-apple-darwin"
+          chmod +x "$GITHUB_WORKSPACE"/src-tauri/binaries/ffmpeg-* "$GITHUB_WORKSPACE"/src-tauri/binaries/ffprobe-*
+          ls -l "$GITHUB_WORKSPACE/src-tauri/binaries"
+
+      - name: Download FFmpeg sidecars (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/binaries
+          cd "$(mktemp -d)"
+          curl -fsSL -o ffmpeg-linux64-lgpl.tar.xz https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz
+          tar -xf ffmpeg-linux64-lgpl.tar.xz
+          cp ffmpeg-*/bin/ffmpeg "$GITHUB_WORKSPACE/src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu"
+          cp ffmpeg-*/bin/ffprobe "$GITHUB_WORKSPACE/src-tauri/binaries/ffprobe-x86_64-unknown-linux-gnu"
+          chmod +x "$GITHUB_WORKSPACE"/src-tauri/binaries/ffmpeg-* "$GITHUB_WORKSPACE"/src-tauri/binaries/ffprobe-*
+          ls -l "$GITHUB_WORKSPACE/src-tauri/binaries"
+
+      # Builds the frontend (beforeBuildCommand: npm run build) and the
+      # Tauri app, then signs the updater artifacts with the private key
+      # from the repository secret. The key has no password, so no password
+      # environment variable is set. Code signing stays unsigned: no
+      # signing identity is configured here.
+      - name: Build Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npx tauri build
+
+      - name: Collect bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.sidecar_os }}
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/**/*.zip
+            src-tauri/target/release/bundle/**/*.tar.gz
+            src-tauri/target/release/bundle/**/*.sig
+            src-tauri/target/release/bundle/**/latest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=${{ inputs.tag }}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      # Each build leg writes its own latest.json containing only its own
+      # platform key, but the updater endpoint serves a single static
+      # manifest (see tauri-plugin-updater: the client picks its entry
+      # from the `platforms` object). Merge the three per-leg manifests
+      # into one latest.json and drop the per-leg copies, so the release
+      # holds exactly one latest.json covering every platform.
+      - name: Merge per-platform updater manifests
+        run: |
+          python3 - <<'EOF'
+          import glob
+          import json
+          import os
+
+          merged = None
+          for path in sorted(glob.glob("release-artifacts/**/latest.json", recursive=True)):
+              with open(path) as fh:
+                  manifest = json.load(fh)
+              if merged is None:
+                  merged = manifest
+              else:
+                  assert merged.get("version") == manifest.get("version"), (
+                      f"version mismatch between updater manifests: {path}"
+                  )
+                  for key in manifest.get("platforms", {}):
+                      assert key not in merged["platforms"], (
+                          f"duplicate platform {key} in updater manifests"
+                      )
+                  merged["platforms"].update(manifest.get("platforms", {}))
+              os.remove(path)
+          assert merged is not None, "no latest.json found in build artifacts"
+          assert len(merged.get("platforms", {})) == 3, (
+              f"expected 3 platforms in merged manifest, got {sorted(merged.get('platforms', {}))}"
+          )
+          with open("release-artifacts/latest.json", "w") as fh:
+              json.dump(merged, fh, indent=2)
+          print("merged platforms:", sorted(merged["platforms"]))
+          EOF
+
+      # Plain npx build above plus softprops/action-gh-release was chosen
+      # over tauri-action: the release contents are explicit here (every
+      # installer plus the updater .sig files and latest.json), the same
+      # step works for both tag pushes and manual dispatch, and no extra
+      # third-party action controls the release lifecycle.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: release-artifacts/**
+          generate_release_notes: true
+          fail_on_unmatched_files: true
