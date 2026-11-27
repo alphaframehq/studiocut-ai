@@ -2,7 +2,7 @@
 name = "studiocut-ai"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.91"
 
 [lib]
 path = "src/lib.rs"
@@ -42,3 +42,9 @@ zeroize = "1"
 ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
 sha2 = "0.10"
 schemars = { version = "0.8", features = ["uuid1"] }
+# BlazeFace full-range face detection (bundled ONNX, converted
+# in-house from the official MediaPipe `.tflite`; see
+# `assets/face-detection/README.md`). CPU-only: no GPU backends.
+# `tract` 0.23 declares rust-version 1.91, which is why this package
+# requires 1.91 (CI builds on stable, so this is a floor, not a pin).
+tract = { version = "0.23", default-features = false, features = ["onnx"] }

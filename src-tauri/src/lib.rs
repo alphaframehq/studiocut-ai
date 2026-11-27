@@ -4,6 +4,7 @@ pub mod analysis;
 pub mod credentials;
 pub mod director;
 pub mod edl;
+pub mod face;
 pub mod filtergraph;
 pub mod finishing;
 pub mod license;
