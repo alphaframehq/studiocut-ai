@@ -192,6 +192,12 @@ fn validate_connection_name(name: &str) -> Result<String, String> {
 /// default (`Authorization`). Otherwise the name must be a valid HTTP
 /// header token of 1–120 characters.
 pub fn validate_auth_header(header: &str) -> Result<String, String> {
+    // Control characters are never valid in a header name, even at the
+    // edges: check before trimming, so a value like "X-Header\n" is
+    // rejected rather than silently cleaned to a valid name.
+    if header.chars().any(|c| c.is_control()) {
+        return Err("Authorization header must be a valid header name of 1–120 characters".into());
+    }
     let header = header.trim();
     if header.is_empty() {
         return Ok(DEFAULT_AUTH_HEADER.to_owned());
