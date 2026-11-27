@@ -63,6 +63,12 @@ npm run tauri build  # release desktop build (license-gated; builds the installe
   fallback: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
   `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`,
   `VERTEX_ACCESS_TOKEN`.
+- **API connections** — save a base URL and key once in the API Connections
+  panel (toolbar toggle, off by default), test it there, then pick it in the
+  AI Director (OpenAI-compatible provider) or in a custom MCP server form.
+  OpenAI-compatible APIs work immediately; any other API needs a connector
+  and is out of scope for this feature. Choosing a connection is always
+  explicit — nothing is switched automatically.
 - **AI & encoding** — preferred encoder (Auto / libx264 / NVENC / VideoToolbox /
   AMF / QSV). It is the default in the Export dialog; hardware candidates are
   probe-checked and fall back to libx264 with a disclosure.

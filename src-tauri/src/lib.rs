@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod ai_gaps;
 pub mod analysis;
+pub mod api_connections;
 pub mod credentials;
 pub mod director;
 pub mod edl;

@@ -19,6 +19,10 @@ name = "persistence"
 path = "tests/persistence.rs"
 
 [[test]]
+name = "api_connections"
+path = "tests/api_connections.rs"
+
+[[test]]
 name = "media"
 path = "tests/media.rs"
 
