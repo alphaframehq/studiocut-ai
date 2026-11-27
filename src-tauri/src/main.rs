@@ -329,9 +329,11 @@ async fn proxy_status(
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
         .join("media");
-    tauri::async_runtime::spawn_blocking(move || studiocut_ai::proxy::proxy_status(&root, &asset))
-        .await
-        .map_err(|e| e.to_string())?
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        studiocut_ai::proxy::proxy_status(&root, &asset)
+    })
+    .await
+    .map_err(|e| e.to_string())?)
 }
 
 /// Generate (or regenerate) the 540p proxy for a video asset. The

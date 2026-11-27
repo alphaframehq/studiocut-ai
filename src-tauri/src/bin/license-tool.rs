@@ -184,7 +184,7 @@ fn cmd_issue(args: &[String]) -> Result<(), String> {
         let value = || {
             args.get(i + 1)
                 .ok_or("Missing value for an issue option".to_string())
-                .map(str::to_string)
+                .map(|value| value.to_string())
         };
         match args[i].as_str() {
             "--seed" => seed = Some(value()?),
@@ -235,7 +235,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
         let value = || {
             args.get(i + 1)
                 .ok_or("Missing value for a verify option".to_string())
-                .map(str::to_string)
+                .map(|value| value.to_string())
         };
         match args[i].as_str() {
             "--license" => text = Some(value()?),
@@ -282,10 +282,10 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "help" | "--help" | "-h" => {
-            println!("{usage}");
+            println!("{}", usage());
             Ok(())
         }
-        other => Err(format!("Unknown command: {other}\n\n{usage}")),
+        other => Err(format!("Unknown command: {other}\n\n{}", usage())),
     }
 }
 
