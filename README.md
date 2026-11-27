@@ -6,8 +6,9 @@ with your own API keys (BYOK); there is no built-in key and no cloud account.
 
 > Status: **v0.1.0, in active development.** The editor, timeline, transcription,
 > AI Director and FFmpeg export work; native desktop qualification on real
-> Windows/macOS/Linux hardware is still open, and releases are Linux `.deb` only
-> for now. See `PLAN.md` for the milestone record and its honest limits.
+> Windows/macOS/Linux hardware is still open, and installers are configured
+> for Linux `.deb`, Windows NSIS/MSI, and macOS `.dmg`. See `PLAN.md` for the
+> milestone record and its honest limits.
 
 ## What it does
 
@@ -51,7 +52,7 @@ npm install
 npm run dev          # web preview only (port 3000; Tauri features disabled)
 npm run tauri dev    # full desktop app (dev build: license gate bypassed)
 npm run build        # tsc + vite build
-npm run tauri build  # release desktop build (license-gated, .deb only)
+npm run tauri build  # release desktop build (license-gated; builds the installer for the host OS)
 ```
 
 ## Settings (in-app, Settings button)
@@ -68,6 +69,74 @@ npm run tauri build  # release desktop build (license-gated, .deb only)
 - **Transcription** — `whisper-cli` path/command and GGML model path. Saved
   persistently and shared with the Analysis panel.
 - **License** — paste a `base64payload.signature` license file to activate.
+
+## Release
+
+### Installers
+
+`npm run tauri build` builds the installer for the host operating system
+only: `.deb` on Linux, NSIS/MSI on Windows, `.dmg` on macOS. Build each
+platform on its native operating system (or in CI, one job per operating
+system); cross-platform installer builds are not supported. The bundle
+targets are configured in `src-tauri/tauri.conf.json` (`deb`, `nsis`,
+`msi`, `dmg`). No code-signing identity or certificate is configured in
+this repository: before distributing a build, sign it with the platform
+identity (Apple Developer ID with notarization on macOS; a code-signing
+certificate on Windows) and record the identity used.
+
+### Issuing a license
+
+Release builds require an offline Ed25519 license signed by the vendor
+key; development builds bypass the gate. Licenses are issued with the
+`license-tool` binary (`src-tauri/src/bin/license-tool.rs`):
+
+```bash
+cargo run --locked --release --bin license-tool -- generate-key
+cargo run --locked --release --bin license-tool -- issue --seed <hex-seed> --name "Jane Doe" --email jane@example.com --fingerprint <machine-fingerprint> --expires never
+cargo run --locked --release --bin license-tool -- verify --license <license-text> --fingerprint <machine-fingerprint> --public-key <hex-public-key>
+```
+
+`generate-key` prints a new private seed and the matching public key.
+Store the private seed offline and never commit it. Paste the printed
+public key into `LICENSE_PUBLIC_KEY` in `src-tauri/src/license.rs` and
+rebuild before issuing licenses with the new key; licenses signed with a
+previous key stop verifying after the public key is replaced, so plan key
+rotation before any public release. The machine fingerprint is shown in
+the application under Settings › License; a license is bound to that
+single machine. `--expires` accepts `never` or a Unix timestamp in
+seconds. On Windows, `generate-key` needs `--seed` with 32 random bytes
+(for example from `openssl rand -hex 32`); on Linux and macOS it reads
+`/dev/urandom`.
+
+### Updates
+
+The updater is configured in `src-tauri/tauri.conf.json` under
+`plugins.updater`, but the configuration is a placeholder and must be
+replaced before any release that offers updates:
+
+- `endpoints` points at `https://example.invalid/studiocut-updates/...`
+  (`example.invalid` never resolves). Replace it with the real update
+  server or static manifest URL.
+- `pubkey` is the literal string `REPLACE_WITH_UPDATER_PUBLIC_KEY`.
+  Replace it with the public key from `tauri signer generate`.
+- Set `bundle.createUpdaterArtifacts` to `true` and provide the private
+  signing key as the `TAURI_SIGNING_PRIVATE_KEY` environment variable at
+  build time; without it, the build fails. Never commit the private key.
+
+The updater plugin (`tauri-plugin-updater`, with `tauri-plugin-process`
+for restart) is not yet wired into the build: add both crates to
+`src-tauri/Cargo.toml`, register the plugin in `src-tauri/src/main.rs`,
+and grant the `updater` capability in `src-tauri/capabilities/main.json`.
+The plugin requires Rust 1.90 or later, while this crate currently
+declares Rust 1.77.2.
+
+### Still manual before release
+
+- Desktop verification on real Windows, macOS, and Linux hardware
+  (install, launch, license activation, Director, export).
+- Code signing and, on macOS, notarization.
+- The first published update served from the real update endpoint, with
+  the signature verified by a fresh install.
 
 ## Tests
 
@@ -98,8 +167,11 @@ SETUP_BINARIES.md  per-OS install guide for ffmpeg / whisper.cpp
 - Portrait/square canvases are letterboxed into 16:9 on export.
 - One export job at a time; max 128 clips per render.
 - No autosave yet — save explicitly (`.studiocut` file).
-- No license-issuing tooling in this repo; release builds need a vendor-signed
-  license to run Director/export.
+- Release builds need a vendor-signed license to run Director/export;
+  see the Release section for the issuing tool.
+- The updater endpoint and public key in `src-tauri/tauri.conf.json` are
+  placeholders; they must be replaced before any release that offers
+  updates.
 
 ## License
 

@@ -3,5 +3,5 @@
   "identifier": "main-window",
   "description": "Local main window with no frontend filesystem or shell access",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "updater:default"]
 }
