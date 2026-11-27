@@ -452,7 +452,7 @@ fn oauth_url_pkce_and_token_bodies_are_well_formed() {
         "state-xyz",
     )
     .is_err());
-    assert_eq!(percent_encode_form_value("a b&c=d"), "a+b%26c%3D");
+    assert_eq!(percent_encode_form_value("a b&c=d"), "a+b%26c%3Dd");
     let exchange = build_token_exchange_body(
         "client-1",
         "SplxlOBeZQQ",

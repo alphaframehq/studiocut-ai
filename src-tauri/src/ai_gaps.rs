@@ -685,11 +685,15 @@ pub fn energy_weighted_flux(samples: &[i16], sample_rate: u32) -> Vec<f32> {
 /// Estimate the tempo (60–180 BPM) from an onset envelope by
 /// autocorrelation, with the prominence of the winning tempo (best lag
 /// score divided by the mean lag score). The fastest tempo whose
-/// autocorrelation score is within 90% of the best score wins, which
+/// autocorrelation score is within 50% of the best score wins, which
 /// resolves the common half/double-tempo ambiguity towards the faster
-/// reading. Returns `None` when the envelope is too short, carries no
-/// onset energy, or the pulse does not stand out from the average lag
-/// score (prominence below 1.5: speech, ambience, rubato music).
+/// reading: when the true period is a non-integer number of envelope
+/// hops, rounding jitter dilutes the single-period score while the
+/// double-period score concentrates, so the band must be wide enough
+/// to admit the faster reading. Returns `None` when the envelope is
+/// too short, carries no onset energy, or the pulse does not stand out
+/// from the average lag score (prominence below 1.5: speech, ambience,
+/// rubato music).
 pub fn estimate_bpm_with_prominence(flux: &[f32], hop_seconds: f64) -> Option<(f64, f64)> {
     if flux.len() < 64 || !hop_seconds.is_finite() || hop_seconds <= 0.0 {
         return None;
@@ -725,7 +729,7 @@ pub fn estimate_bpm_with_prominence(flux: &[f32], hop_seconds: f64) -> Option<(f
     }
     let fastest = scores
         .iter()
-        .filter(|(_, score)| *score >= 0.9 * best)
+        .filter(|(_, score)| *score >= 0.5 * best)
         .map(|(bpm, _)| *bpm)
         .fold(0.0f64, f64::max);
     if fastest > 0.0 {

@@ -496,7 +496,7 @@ mod tests {
         // Records written before encoder tracking omit the field and
         // still parse, with no encoder recorded.
         let legacy: ProxyRecord = serde_json::from_str(
-            r#"{"state":"Ready","width":960,"height":540,"sizeBytes":12345,"sourceSizeBytes":999,"sourceModifiedNs":"123","error":null,"updatedAtMs":1}"#,
+            r#"{"state":"ready","width":960,"height":540,"sizeBytes":12345,"sourceSizeBytes":999,"sourceModifiedNs":"123","error":null,"updatedAtMs":1}"#,
         )
         .unwrap();
         assert_eq!(legacy.encoder, None);

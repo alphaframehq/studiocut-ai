@@ -3365,7 +3365,7 @@ mod tests {
     #[test]
     fn form_encoding_and_token_bodies_are_exact() {
         assert_eq!(percent_encode_form_value("abc-._~XYZ09"), "abc-._~XYZ09");
-        assert_eq!(percent_encode_form_value("a b&c=d"), "a+b%26c%3D");
+        assert_eq!(percent_encode_form_value("a b&c=d"), "a+b%26c%3Dd");
         assert_eq!(
             percent_encode_form_value("http://127.0.0.1:49152/callback"),
             "http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"
