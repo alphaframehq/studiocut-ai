@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod analysis;
 pub mod credentials;
 pub mod director;

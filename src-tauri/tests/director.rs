@@ -247,6 +247,8 @@ fn provider_contracts_context_limits_and_missing_credentials() {
             "Edit".into(),
             true,
             "edit",
+            None,
+            None,
         )
         .err()
         .unwrap()
@@ -259,6 +261,8 @@ fn provider_contracts_context_limits_and_missing_credentials() {
             "Edit".into(),
             false,
             "edit",
+            None,
+            None,
         )
         .err()
         .unwrap()
