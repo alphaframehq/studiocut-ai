@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { X } from 'lucide-react';
-import { DEFAULT_STYLE_DNA, getEncoderPreference, getStyleDna, getWhisperBinary, getWhisperModel, resetDirectorFeedback, setEncoderPreference, setStyleDna, setWhisperBinary, setWhisperModel, type ListedModel, type StyleDNA } from './preferences';
+import { DEFAULT_STYLE_DNA, SUPPORT_URL, getEncoderPreference, getStyleDna, getWhisperBinary, getWhisperModel, resetDirectorFeedback, setEncoderPreference, setStyleDna, setWhisperBinary, setWhisperModel, type ListedModel, type StyleDNA } from './preferences';
 
 type Provider = 'gemini' | 'openai' | 'claude' | 'groq' | 'openrouter' | 'compatible' | 'ollama' | 'bedrock' | 'vertex';
 type LicenseStatus = { fingerprint: string; mode: string; licensed: boolean; license: { name: string; email: string; expiresAt: number | null } | null };
@@ -172,6 +172,7 @@ export function SettingsModal() {
           <div role="status" aria-live="polite">{licenseMessage}</div>{licenseError && <p className="error" role="alert">{licenseError}</p>}
         </section>}
       </div>
+      {SUPPORT_URL && <footer className="settings-footer"><a className="button secondary" href={SUPPORT_URL} target="_blank" rel="noreferrer">Support StudioCut AI on Buy Me a Coffee</a></footer>}
     </dialog>
   </>;
 }
