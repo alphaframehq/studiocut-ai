@@ -1,11 +1,48 @@
 //! Colour scopes for the frame at the playhead: waveform, histogram and
 //! vectorscope, computed in Rust from a single frame extracted by FFmpeg.
 //!
-//! The frame is sampled at no more than 320 px wide before analysis, so
-//! every scope is an approximation of the full-resolution frame. The
-//! returned [`ScopeData::approximate`] flag is always `true` and the UI
-//! must show the approximation notice; these scopes are a grading aid,
-//! not a broadcast measurement.
+//! By default the frame is sampled at no more than 320 px wide before
+//! analysis, so every scope is an approximation of the full-resolution
+//! frame. The caller may instead request full-resolution sampling
+//! ([`analyze_scopes`] with `full_resolution` set), which analyses the
+//! native frame; it is slower, especially on large sources, and is an
+//! explicit choice in the UI. In either mode the returned
+//! [`ScopeData::approximate`] flag states which sampling was used and
+//! the UI must show the corresponding notice; these scopes are a
+//! grading aid, not a broadcast measurement.
+//!
+//! ## Coordinator integration (main.rs — this module does not register
+//! ## commands itself, because the workspace state lives in main.rs)
+//!
+//! The existing `analyze_scopes` command gains a `full_resolution`
+//! parameter (default sampled mode when `false`):
+//!
+//! ```rust
+//! #[tauri::command]
+//! async fn analyze_scopes(
+//!     state: State<'_, Workspace>,
+//!     project_id: uuid::Uuid,
+//!     revision: u64,
+//!     clip_id: uuid::Uuid,
+//!     at_seconds: f64,
+//!     full_resolution: bool,
+//! ) -> Result<studiocut_ai::scopes::ScopeData, String> {
+//!     let project = analysis_snapshot(&state, project_id, revision)?;
+//!     tauri::async_runtime::spawn_blocking(move || {
+//!         studiocut_ai::scopes::analyze_scopes(&project, clip_id, at_seconds, full_resolution)
+//!     })
+//!     .await
+//!     .map_err(|e| e.to_string())?
+//! }
+//! ```
+//!
+//! Frontend invoke call:
+//!
+//! ```ts
+//! const scopes = await invoke<ScopeData>('analyze_scopes', {
+//!   projectId, revision, clipId, atSeconds, fullResolution: false,
+//! });
+//! ```
 
 use crate::{media, Project};
 use serde::Serialize;
@@ -31,8 +68,16 @@ pub struct ScopeData {
     pub sample_width: u32,
     /// Height of the sampled frame the scopes were computed from.
     pub sample_height: u32,
-    /// Always `true`: scopes are computed from a downscaled sample frame.
+    /// `true` when the scopes were computed from a downscaled sample
+    /// frame (the default, at most [`SCOPE_SAMPLE_WIDTH`] px on the long
+    /// edge); `false` when full-resolution sampling was requested and
+    /// the native frame was analysed. Either way the scopes are a
+    /// grading aid, not a broadcast measurement.
     pub approximate: bool,
+    /// `true` when full-resolution sampling was requested: the sample
+    /// frame is the native source frame. Always the opposite of
+    /// [`ScopeData::approximate`].
+    pub full_resolution: bool,
     /// Per-column luma range: `[min, max]` luma (0-255) for each of
     /// [`WAVEFORM_COLUMNS`] columns, left to right.
     pub waveform: Vec<[u8; 2]>,
@@ -52,12 +97,18 @@ pub struct ScopeData {
     pub vectorscope_peak: u32,
 }
 
-/// Sample-frame dimensions for a source frame, capped so the long edge
-/// is at most [`SCOPE_SAMPLE_WIDTH`] px. Small sources keep their native
-/// size (they are never upscaled for analysis).
-pub fn sample_dimensions(width: u32, height: u32) -> (u32, u32) {
+/// Sample-frame dimensions for a source frame.
+///
+/// With `full_resolution` set, the native dimensions are returned
+/// unchanged: the frame is analysed at full resolution. Otherwise the
+/// long edge is capped at [`SCOPE_SAMPLE_WIDTH`] px. Small sources keep
+/// their native size (they are never upscaled for analysis).
+pub fn sample_dimensions(width: u32, height: u32, full_resolution: bool) -> (u32, u32) {
     if width == 0 || height == 0 {
         return (0, 0);
+    }
+    if full_resolution {
+        return (width, height);
     }
     let long = width.max(height);
     if long <= SCOPE_SAMPLE_WIDTH {
@@ -172,14 +223,17 @@ pub fn vectorscope_grid(pixels: &[u8], width: u32, height: u32) -> (Vec<u32>, u3
 }
 
 /// Shape raw RGB24 pixels of `width` x `height` into [`ScopeData`].
-/// Pure shaping: no I/O, no FFmpeg.
-pub fn shape_scopes(pixels: &[u8], width: u32, height: u32) -> ScopeData {
+/// Pure shaping: no I/O, no FFmpeg. `full_resolution` records whether
+/// the pixels are the native frame (`true`, `approximate` is `false`)
+/// or a downscaled sample (`false`, `approximate` is `true`).
+pub fn shape_scopes(pixels: &[u8], width: u32, height: u32, full_resolution: bool) -> ScopeData {
     let (red, green, blue) = channel_histograms(pixels, width, height);
     let (vectorscope, vectorscope_peak) = vectorscope_grid(pixels, width, height);
     ScopeData {
         sample_width: width,
         sample_height: height,
-        approximate: true,
+        approximate: !full_resolution,
+        full_resolution,
         waveform: waveform_columns(pixels, width, height),
         histogram_luma: luma_histogram(pixels, width, height),
         histogram_red: red,
@@ -191,13 +245,18 @@ pub fn shape_scopes(pixels: &[u8], width: u32, height: u32) -> ScopeData {
 }
 
 /// Analyse the frame of `clip_id` at `at_seconds` (seconds into the
-/// clip) and return its scopes. The frame is extracted by FFmpeg at no
-/// more than [`SCOPE_SAMPLE_WIDTH`] px on the long edge, so the result
-/// is always approximate (see [`ScopeData::approximate`]).
+/// clip) and return its scopes. By default the frame is extracted by
+/// FFmpeg at no more than [`SCOPE_SAMPLE_WIDTH`] px on the long edge,
+/// so the result is approximate (see [`ScopeData::approximate`]).
+/// With `full_resolution` set, the native frame is extracted and
+/// analysed instead: the result is not approximate, but extraction and
+/// analysis are slower, especially on large sources. In either mode
+/// the scopes are a grading aid, not a broadcast measurement.
 pub fn analyze_scopes(
     project: &Project,
     clip_id: Uuid,
     at_seconds: f64,
+    full_resolution: bool,
 ) -> Result<ScopeData, String> {
     project.validate()?;
     let clip = project
@@ -219,36 +278,41 @@ pub fn analyze_scopes(
         return Err("Scope time must be inside the selected clip".into());
     }
     let (width, height) = (asset.width.unwrap_or(0), asset.height.unwrap_or(0));
-    let (sample_width, sample_height) = sample_dimensions(width, height);
+    let (sample_width, sample_height) = sample_dimensions(width, height, full_resolution);
     if sample_width == 0 || sample_height == 0 {
         return Err("Source video has no dimensions".into());
     }
     let source_path = media::verified_source(asset)?;
     let source_time = clip.source_in as f64 / project.settings.fps as f64 + at_seconds;
     let max_bytes = sample_width as u64 * sample_height as u64 * 3;
-    let file = media::run(
-        "ffmpeg",
-        &[
-            "-v",
-            "error",
-            "-nostdin",
-            "-ss",
-            &source_time.to_string(),
-            "-i",
-            source_path.to_str().ok_or("Invalid media path")?,
-            "-frames:v",
-            "1",
-            "-vf",
-            &format!("scale={sample_width}:{sample_height}:force_original_aspect_ratio=decrease"),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ],
-        Duration::from_secs(30),
-        max_bytes,
-    )?;
+    // Full-resolution mode extracts the native frame (no scale filter);
+    // sampled mode downscales to the sample dimensions.
+    let mut args: Vec<String> = vec![
+        "-v".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-ss".into(),
+        source_time.to_string(),
+        "-i".into(),
+        source_path.to_str().ok_or("Invalid media path")?.into(),
+        "-frames:v".into(),
+        "1".into(),
+    ];
+    if !full_resolution {
+        args.push("-vf".into());
+        args.push(format!(
+            "scale={sample_width}:{sample_height}:force_original_aspect_ratio=decrease"
+        ));
+    }
+    args.extend([
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "rgb24".into(),
+        "pipe:1".into(),
+    ]);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let file = media::run("ffmpeg", &arg_refs, Duration::from_secs(30), max_bytes)?;
     let mut pixels = Vec::new();
     file.take(max_bytes + 1)
         .read_to_end(&mut pixels)
@@ -256,13 +320,17 @@ pub fn analyze_scopes(
     if pixels.len() as u64 != max_bytes {
         return Err("Frame extraction returned incomplete pixel data".into());
     }
-    Ok(shape_scopes(&pixels, sample_width, sample_height))
+    Ok(shape_scopes(
+        &pixels,
+        sample_width,
+        sample_height,
+        full_resolution,
+    ))
 }
 
 /// Pure audio-mixer gain maths, shared with the `AudioMixer` UI (which
 /// mirrors these functions in TypeScript). Gain is stored per track and
-/// is preview-only in this phase: it is not applied to preview playback
-/// or to export.
+/// is applied to preview playback and to export.
 pub mod audio_gain {
     /// Gain range offered by the mixer sliders, in dB.
     pub const MIN_GAIN_DB: f64 = -60.0;
@@ -307,10 +375,18 @@ mod tests {
 
     #[test]
     fn sample_dimensions_caps_the_long_edge() {
-        assert_eq!(sample_dimensions(1920, 1080), (320, 180));
-        assert_eq!(sample_dimensions(1080, 1920), (180, 320));
-        assert_eq!(sample_dimensions(160, 90), (160, 90));
-        assert_eq!(sample_dimensions(0, 90), (0, 0));
+        assert_eq!(sample_dimensions(1920, 1080, false), (320, 180));
+        assert_eq!(sample_dimensions(1080, 1920, false), (180, 320));
+        assert_eq!(sample_dimensions(160, 90, false), (160, 90));
+        assert_eq!(sample_dimensions(0, 90, false), (0, 0));
+    }
+
+    #[test]
+    fn sample_dimensions_full_resolution_keeps_native_size() {
+        assert_eq!(sample_dimensions(1920, 1080, true), (1920, 1080));
+        assert_eq!(sample_dimensions(1080, 1920, true), (1080, 1920));
+        assert_eq!(sample_dimensions(160, 90, true), (160, 90));
+        assert_eq!(sample_dimensions(0, 90, true), (0, 0));
     }
 
     #[test]
@@ -364,8 +440,20 @@ mod tests {
     #[test]
     fn shape_scopes_is_always_approximate() {
         let pixels = solid_pixels(2, 2, 10, 20, 30);
-        let scopes = shape_scopes(&pixels, 2, 2);
+        let scopes = shape_scopes(&pixels, 2, 2, false);
         assert!(scopes.approximate);
+        assert!(!scopes.full_resolution);
+        assert_eq!((scopes.sample_width, scopes.sample_height), (2, 2));
+        assert_eq!(scopes.histogram_luma.iter().sum::<u32>(), 4);
+        assert_eq!(scopes.vectorscope_peak, 4);
+    }
+
+    #[test]
+    fn shape_scopes_full_resolution_is_not_approximate() {
+        let pixels = solid_pixels(2, 2, 10, 20, 30);
+        let scopes = shape_scopes(&pixels, 2, 2, true);
+        assert!(!scopes.approximate);
+        assert!(scopes.full_resolution);
         assert_eq!((scopes.sample_width, scopes.sample_height), (2, 2));
         assert_eq!(scopes.histogram_luma.iter().sum::<u32>(), 4);
         assert_eq!(scopes.vectorscope_peak, 4);
@@ -373,10 +461,14 @@ mod tests {
 
     #[test]
     fn short_pixel_buffers_shape_to_empty_scopes() {
-        let scopes = shape_scopes(&[1, 2, 3], 4, 4);
+        let scopes = shape_scopes(&[1, 2, 3], 4, 4, false);
         assert_eq!(scopes.histogram_luma.iter().sum::<u32>(), 0);
         assert_eq!(scopes.vectorscope_peak, 0);
         assert!(scopes.waveform.iter().all(|c| *c == [0, 0]));
+        // The full-resolution flag is honoured even for empty input.
+        let full = shape_scopes(&[1, 2, 3], 4, 4, true);
+        assert!(!full.approximate);
+        assert!(full.full_resolution);
     }
 
     #[test]
