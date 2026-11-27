@@ -314,7 +314,9 @@ fn reframe_9_16_centre_crop_is_even_and_centred() {
         }
     );
     assert_eq!(plan.ffmpeg_filter, "crop=606:1080:656:0");
-    assert!(plan.note.contains("face tracking unavailable"));
+    assert!(plan.note.contains("no face is detected by this crop"));
+    assert!(plan.keyframes.is_empty());
+    assert_eq!(plan.face_confidence, None);
 }
 
 #[test]
@@ -357,11 +359,33 @@ fn capabilities_report_unavailable_methods_honestly() {
     assert_eq!(diarization.method, "heuristic");
     assert!(diarization.note.contains("no speaker segmentation"));
     let reframe = ai_gaps::reframe_capability();
-    assert!(!reframe.face_tracking_available);
+    assert!(reframe.face_tracking_available);
     assert!(reframe.motion_reframe_available);
-    assert_eq!(reframe.method, "centre-crop");
-    assert!(reframe.note.contains("No face-detection model"));
+    assert_eq!(reframe.method, "face-tracked");
+    assert!(reframe.note.contains("BlazeFace"));
     assert!(reframe.note.contains("motion-weighted"));
+}
+
+#[test]
+fn reframe_plan_without_track_fields_still_parses() {
+    // Plans written before face tracking carry no keyframes or face
+    // confidence; serde defaults must keep them loadable.
+    let plan: ai_gaps::ReframePlan = serde_json::from_str(
+        r#"{"method":"centre-crop","target":"9:16","sourceWidth":1920,"sourceHeight":1080,"crop":{"x":656,"y":0,"width":606,"height":1080},"ffmpegFilter":"crop=606:1080:656:0","motionConfidence":null,"note":"Centre crop."}"#,
+    )
+    .unwrap();
+    assert_eq!(plan.method, "centre-crop");
+    assert!(plan.keyframes.is_empty());
+    assert_eq!(plan.face_confidence, None);
+    // A face-tracked plan round-trips with its keyframes intact.
+    let tracked: ai_gaps::ReframePlan = serde_json::from_str(
+        r#"{"method":"face-tracked","target":"9:16","sourceWidth":1920,"sourceHeight":1080,"crop":{"x":656,"y":0,"width":606,"height":1080},"ffmpegFilter":"crop=606:1080:656:0","motionConfidence":null,"keyframes":[{"tSeconds":0.0,"focusX":0.2,"focusY":0.5},{"tSeconds":1.0,"focusX":0.8,"focusY":0.5}],"faceConfidence":0.85,"note":"Face-tracked reframe."}"#,
+    )
+    .unwrap();
+    assert_eq!(tracked.method, "face-tracked");
+    assert_eq!(tracked.keyframes.len(), 2);
+    assert_eq!(tracked.keyframes[1].focus_x, 0.8);
+    assert_eq!(tracked.face_confidence, Some(0.85));
 }
 
 /// A 16x8 frame pair where only one motion-grid cell changes: the
