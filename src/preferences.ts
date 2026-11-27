@@ -29,6 +29,11 @@ export const DEFAULT_ENCODER: EncoderPreference = 'auto';
 export const DEFAULT_WHISPER_BINARY = 'whisper-cli';
 export const DEFAULT_WHISPER_MODEL = '';
 
+// Support link shown in Settings and in the README. This is the single
+// place the URL lives in code: fill in the maintainer's Buy Me a Coffee
+// URL here. Leave it empty ('') to hide the link entirely.
+export const SUPPORT_URL = 'https://buymeacoffee.com/devnarayan9';
+
 function read(key: string): string | null {
   try {
     return localStorage.getItem(key);
