@@ -1301,7 +1301,13 @@ fn main() {
             studiocut_ai::mcp::mcp_higgsfield_submit,
             studiocut_ai::mcp::mcp_higgsfield_status,
             studiocut_ai::mcp::mcp_higgsfield_cancel,
-            studiocut_ai::mcp::mcp_download_result
+            studiocut_ai::mcp::mcp_download_result,
+            studiocut_ai::api_connections::list_api_connections,
+            studiocut_ai::api_connections::add_api_connection,
+            studiocut_ai::api_connections::update_api_connection,
+            studiocut_ai::api_connections::delete_api_connection,
+            studiocut_ai::api_connections::test_api_connection,
+            studiocut_ai::api_connections::list_connection_models
         ])
         .run(tauri::generate_context!())
         .expect("Failed to launch StudioCut AI");
