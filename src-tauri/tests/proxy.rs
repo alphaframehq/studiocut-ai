@@ -8,7 +8,7 @@ use studiocut_ai::{
     media::{ffmpeg_path, import_media},
     proxy::{
         delete_proxy, export_source, generate_proxy, proxy_path_for, proxy_source, proxy_status,
-        ExportSource, ProxyState,
+        ProxyState,
     },
 };
 

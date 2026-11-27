@@ -441,7 +441,7 @@ pub fn diarize_words_with_energy(
         }
     }
     ranges.push((start, words.len(), pause_before));
-    let mean_energy = |range: (usize, usize)| -> f64 {
+    let mean_energy = |range: (usize, usize, Option<f64>)| -> f64 {
         if energies.is_empty() || range.1 <= range.0 {
             return 0.0;
         }
