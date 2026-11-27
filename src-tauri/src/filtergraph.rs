@@ -1,6 +1,6 @@
 use crate::{edl::Lut, finishing, timeline::Track, Project};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -17,6 +17,18 @@ pub struct ExportSettings {
     /// frame edge to edge and center-crops the overflow.
     #[serde(default = "default_fill")]
     pub fill: String,
+    /// Render from a clip's 540p proxy file when one is ready, falling
+    /// back to the original media otherwise. Defaults to `false`: an
+    /// export never silently uses low-resolution proxies. Old payloads
+    /// omit this field and keep the original-only behaviour.
+    #[serde(default)]
+    pub use_proxy: bool,
+    /// Per-track mixer gain in dB, keyed by track id, as stored by the
+    /// audio mixer. Applied to the export audio through FFmpeg volume
+    /// filters. Defaults to empty (no mixer gain). Values are clamped
+    /// to the mixer range at use; see `scopes::audio_gain`.
+    #[serde(default)]
+    pub track_gains: BTreeMap<String, f64>,
 }
 fn default_aspect() -> String {
     "landscape".into()
@@ -33,6 +45,8 @@ impl Default for ExportSettings {
             encoder: "auto".into(),
             aspect: default_aspect(),
             fill: default_fill(),
+            use_proxy: false,
+            track_gains: BTreeMap::new(),
         }
     }
 }
@@ -52,6 +66,7 @@ impl ExportSettings {
             .contains(&self.encoder.as_str())
             || !["landscape", "vertical", "square"].contains(&self.aspect.as_str())
             || !["fit", "cover"].contains(&self.fill.as_str())
+            || self.track_gains.values().any(|gain| !gain.is_finite())
         {
             return Err("Unsupported export settings".into());
         }
@@ -79,6 +94,10 @@ pub struct Compiled {
     pub graph: String,
     pub resources: BTreeMap<String, String>,
     pub duration: f64,
+    /// Clips whose source resolved to a ready 540p proxy file.
+    pub proxy_clips: usize,
+    /// Media clips compiled into this export (video and audio alike).
+    pub total_clips: usize,
 }
 pub fn enabled(track: &Track, tracks: &[Track]) -> bool {
     !track.muted && (!tracks.iter().any(|t| t.kind == track.kind && t.solo) || track.solo)
@@ -194,7 +213,23 @@ fn captions(project: &Project, width: u32, height: u32) -> String {
     result
 }
 
+/// Compile the export filtergraph from the original media only.
+/// Proxy-aware callers use [`compile_with_media_root`].
 pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled, String> {
+    compile_with_media_root(project, settings, None)
+}
+
+/// Compile the export filtergraph. When `media_root` is given and
+/// `settings.use_proxy` is set, a clip reads from its ready 540p proxy
+/// file and falls back to the original media when no proxy is ready
+/// (see `proxy::export_source`); the original files are never written.
+/// With `media_root` unset, proxy export is rejected rather than
+/// silently falling back to originals for every clip.
+pub fn compile_with_media_root(
+    project: &Project,
+    settings: &ExportSettings,
+    media_root: Option<&Path>,
+) -> Result<Compiled, String> {
     project.validate()?;
     settings.validate()?;
     let end = project
@@ -237,6 +272,8 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
         graph: String::new(),
         resources: BTreeMap::new(),
         duration,
+        proxy_clips: 0,
+        total_clips: 0,
     };
     let mut nodes = vec![format!(
         "color=c=black:s={w}x{h}:r={r}:d={},format=yuv420p[base0]",
@@ -271,8 +308,30 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
                     r.to_string(),
                 ]);
             }
-            let source = std::fs::canonicalize(&asset.source_path)
+            // Proxy export resolves the source through the proxy
+            // module, which only serves a ready proxy whose recorded
+            // fingerprint still matches the original; anything else
+            // falls back to the original media. Without a media root
+            // there is no proxy to resolve, so a proxy request fails
+            // instead of silently exporting originals.
+            let (source, used_proxy) = match media_root {
+                Some(root) => match crate::proxy::export_source(root, asset, settings.use_proxy)? {
+                    crate::proxy::ExportSource::Original(path) => (path, false),
+                    crate::proxy::ExportSource::Proxy(path) => (path, true),
+                },
+                None => {
+                    if settings.use_proxy {
+                        return Err("Proxy export needs the media cache location".into());
+                    }
+                    (std::path::PathBuf::from(&asset.source_path), false)
+                }
+            };
+            let source = std::fs::canonicalize(&source)
                 .map_err(|e| format!("Missing media {}: {e}", asset.name))?;
+            if used_proxy {
+                out.proxy_clips += 1;
+            }
+            out.total_clips += 1;
             out.inputs
                 .extend(["-i".into(), source.to_string_lossy().into_owned()]);
             let time = format!("(t*{}+{})", number(fps * f.speed), clip.source_in);
@@ -399,7 +458,27 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
                     &time,
                     1.0,
                 );
-                chain.push_str(&format!(",volume='{}*({gain})':eval=frame,apad,atrim=duration={},asetpts=N/SR/TB+{}/TB,aresample=48000:first_pts=0[a{input}]",number(f.gain),number(length),number(start)));
+                // Mixer gain for this audio track, in dB as stored by the
+                // audio mixer. Clamped to the mixer range with the shared
+                // helper and converted to a linear multiplier, so the
+                // export contains what the mixer shows. A 0 dB gain
+                // leaves the volume expression unchanged.
+                let mixer_db = crate::scopes::audio_gain::clamp_gain_db(
+                    settings
+                        .track_gains
+                        .get(&track.id.to_string())
+                        .copied()
+                        .unwrap_or(0.0),
+                );
+                let mixer_factor = if mixer_db == 0.0 {
+                    String::new()
+                } else {
+                    format!(
+                        "*{}",
+                        number(crate::scopes::audio_gain::gain_db_to_linear(mixer_db))
+                    )
+                };
+                chain.push_str(&format!(",volume='{}*({gain}){mixer_factor}':eval=frame,apad,atrim=duration={},asetpts=N/SR/TB+{}/TB,aresample=48000:first_pts=0[a{input}]",number(f.gain),number(length),number(start)));
                 nodes.push(chain);
                 let label = format!("a{input}");
                 if f.role == "voice" {
@@ -469,6 +548,8 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::Clip;
+    use uuid::Uuid;
     fn settings(aspect: &str, fill: &str, height: u32) -> ExportSettings {
         ExportSettings {
             container: "mp4".into(),
@@ -477,7 +558,123 @@ mod tests {
             encoder: "libx264".into(),
             aspect: aspect.into(),
             fill: fill.into(),
+            use_proxy: false,
+            track_gains: BTreeMap::new(),
         }
+    }
+    /// One-clip audio project over a real (placeholder) media file, so
+    /// `compile` can canonicalize the source. Returns the project and
+    /// the audio track id.
+    fn audio_project(root: &std::path::Path) -> (Project, Uuid) {
+        let path = root.join("take.wav");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let asset = crate::media::Asset {
+            id: Uuid::new_v4(),
+            source_path: path.to_string_lossy().into_owned(),
+            name: "take.wav".into(),
+            size_bytes: meta.len(),
+            modified_ns: meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string(),
+            kind: "audio".into(),
+            duration: Some(2.0),
+            width: None,
+            height: None,
+            fps: None,
+            video_stream: None,
+            audio_stream: Some(0),
+            video_codec: None,
+            audio_codec: Some("pcm".into()),
+            sample_rate: Some(48000),
+            channels: Some(2),
+            created_at: 0,
+            bin: String::new(),
+        };
+        let mut project = crate::create_project("Mixer gain".into(), 1920, 1080, 30).unwrap();
+        project.schema_version = 6;
+        let track_id = Uuid::new_v4();
+        project.tracks.push(Track {
+            id: track_id,
+            name: "Audio 1".into(),
+            kind: "audio".into(),
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: vec![Clip {
+                id: Uuid::new_v4(),
+                asset_id: asset.id,
+                link_id: None,
+                start: 0,
+                source_in: 0,
+                duration: 30,
+                caption: None,
+                effects: None,
+            }],
+        });
+        project.assets.push(asset);
+        project.validate().unwrap();
+        (project, track_id)
+    }
+    /// One-clip video project over a real (placeholder) media file.
+    /// Returns the project and the asset id.
+    fn video_project(root: &std::path::Path) -> (Project, Uuid) {
+        let path = root.join("take.mp4");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let asset = crate::media::Asset {
+            id: Uuid::new_v4(),
+            source_path: path.to_string_lossy().into_owned(),
+            name: "take.mp4".into(),
+            size_bytes: meta.len(),
+            modified_ns: meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string(),
+            kind: "video".into(),
+            duration: Some(2.0),
+            width: Some(160),
+            height: Some(90),
+            fps: Some(30.0),
+            video_stream: Some(0),
+            audio_stream: None,
+            video_codec: Some("h264".into()),
+            audio_codec: None,
+            sample_rate: None,
+            channels: None,
+            created_at: 0,
+            bin: String::new(),
+        };
+        let mut project = crate::create_project("Proxy export".into(), 1920, 1080, 30).unwrap();
+        project.schema_version = 6;
+        project.tracks.push(Track {
+            id: Uuid::new_v4(),
+            name: "Video 1".into(),
+            kind: "video".into(),
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: vec![Clip {
+                id: Uuid::new_v4(),
+                asset_id: asset.id,
+                link_id: None,
+                start: 0,
+                source_in: 0,
+                duration: 30,
+                caption: None,
+                effects: None,
+            }],
+        });
+        project.assets.push(asset.clone());
+        project.validate().unwrap();
+        (project, asset.id)
     }
     #[test]
     fn export_width_is_derived_per_aspect_and_stays_even() {
@@ -505,5 +702,143 @@ mod tests {
         assert_eq!(parsed.aspect, "landscape");
         assert_eq!(parsed.fill, "fit");
         assert_eq!(parsed.width(), 1920);
+    }
+    #[test]
+    fn old_export_payloads_without_proxy_or_gains_still_parse() {
+        let parsed: ExportSettings =
+            serde_json::from_str(r#"{"container":"mp4","height":1080,"fps":30,"encoder":"auto"}"#)
+                .unwrap();
+        assert!(!parsed.use_proxy);
+        assert!(parsed.track_gains.is_empty());
+        assert!(parsed.validate().is_ok());
+        let parsed: ExportSettings = serde_json::from_str(
+            r#"{"container":"mp4","height":1080,"fps":30,"encoder":"auto","useProxy":true,"trackGains":{"123e4567-e89b-42d3-a456-426614174000":6.0}}"#,
+        )
+        .unwrap();
+        assert!(parsed.use_proxy);
+        assert_eq!(
+            parsed.track_gains["123e4567-e89b-42d3-a456-426614174000"],
+            6.0
+        );
+        assert!(parsed.validate().is_ok());
+    }
+    #[test]
+    fn mixer_gain_is_applied_to_export_audio_as_a_volume_factor() {
+        let root = tempfile::tempdir().unwrap();
+        let (project, track_id) = audio_project(root.path());
+        // +6 dB is a linear factor of 10^(6/20) = 1.99526231.
+        let mut config = settings("landscape", "fit", 1080);
+        config.track_gains.insert(track_id.to_string(), 6.0);
+        let graph = compile(&project, &config).unwrap().graph;
+        assert!(
+            graph.contains("volume='1.00000000*(1.00000000)*1.99526231'"),
+            "{graph}"
+        );
+        // No stored gain leaves the volume expression unchanged.
+        let plain = compile(&project, &settings("landscape", "fit", 1080))
+            .unwrap()
+            .graph;
+        assert!(
+            plain.contains("volume='1.00000000*(1.00000000)':eval=frame"),
+            "{plain}"
+        );
+        // A gain stored for another track id is ignored.
+        let mut other = settings("landscape", "fit", 1080);
+        other.track_gains.insert(Uuid::new_v4().to_string(), 6.0);
+        assert_eq!(compile(&project, &other).unwrap().graph, plain);
+    }
+    #[test]
+    fn mixer_gain_is_clamped_to_the_shared_mixer_range() {
+        let root = tempfile::tempdir().unwrap();
+        let (project, track_id) = audio_project(root.path());
+        // +99 dB clamps to +12 dB (10^0.6 = 3.98107171); -99 dB clamps
+        // to -60 dB (10^-3 = 0.00100000). The clamp helper is the one
+        // shared with the mixer in scopes::audio_gain.
+        let mut config = settings("landscape", "fit", 1080);
+        config.track_gains.insert(track_id.to_string(), 99.0);
+        let graph = compile(&project, &config).unwrap().graph;
+        assert!(graph.contains("*3.98107171'"), "{graph}");
+        config.track_gains.insert(track_id.to_string(), -99.0);
+        let graph = compile(&project, &config).unwrap().graph;
+        assert!(graph.contains("*0.00100000'"), "{graph}");
+        config.track_gains.insert(track_id.to_string(), f64::NAN);
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn proxy_export_without_a_media_root_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let (project, _) = video_project(root.path());
+        let mut config = settings("landscape", "fit", 1080);
+        config.use_proxy = true;
+        let error = compile(&project, &config).unwrap_err();
+        assert!(error.contains("media cache"), "{error}");
+    }
+    #[test]
+    fn proxy_export_falls_back_to_originals_without_a_ready_proxy() {
+        let root = tempfile::tempdir().unwrap();
+        let (project, _) = video_project(root.path());
+        let mut config = settings("landscape", "fit", 1080);
+        config.use_proxy = true;
+        let compiled = compile_with_media_root(&project, &config, Some(root.path())).unwrap();
+        assert_eq!(compiled.proxy_clips, 0);
+        assert_eq!(compiled.total_clips, 1);
+        let original = std::fs::canonicalize(root.path().join("take.mp4"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(compiled.inputs, vec!["-i".to_string(), original]);
+    }
+    #[test]
+    fn proxy_export_uses_a_ready_proxy_and_counts_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (project, asset_id) = video_project(root.path());
+        let asset = project
+            .assets
+            .iter()
+            .find(|a| a.id == asset_id)
+            .unwrap()
+            .clone();
+        // Hand-craft the ready proxy state the generator would record:
+        // a proxy file plus a sidecar whose fingerprint matches the
+        // original.
+        let proxy_path = crate::proxy::proxy_path_for(root.path(), asset_id);
+        std::fs::create_dir_all(proxy_path.parent().unwrap()).unwrap();
+        std::fs::write(&proxy_path, [0u8; 128]).unwrap();
+        let record = crate::proxy::ProxyRecord {
+            state: crate::proxy::ProxyState::Ready,
+            width: Some(96),
+            height: Some(54),
+            size_bytes: Some(128),
+            encoder: Some("libx264".into()),
+            source_size_bytes: asset.size_bytes,
+            source_modified_ns: asset.modified_ns.clone(),
+            error: None,
+            updated_at_ms: 1,
+        };
+        std::fs::write(
+            crate::proxy::proxy_sidecar_path(root.path(), asset_id),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut config = settings("landscape", "fit", 1080);
+        config.use_proxy = true;
+        let compiled = compile_with_media_root(&project, &config, Some(root.path())).unwrap();
+        assert_eq!(compiled.proxy_clips, 1);
+        assert_eq!(compiled.total_clips, 1);
+        assert_eq!(
+            compiled.inputs,
+            vec![
+                "-i".to_string(),
+                std::fs::canonicalize(&proxy_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        // With the option off, the same project exports the original.
+        config.use_proxy = false;
+        let compiled = compile_with_media_root(&project, &config, Some(root.path())).unwrap();
+        assert_eq!(compiled.proxy_clips, 0);
+        assert_eq!(compiled.total_clips, 1);
     }
 }
