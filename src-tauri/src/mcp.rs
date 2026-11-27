@@ -1530,14 +1530,19 @@ impl McpCredentials {
             .lock()
             .map_err(|_| "Credential lock unavailable")?
             .remove(server_id);
-        // No OS store available means nothing could have been stored
-        // there; the session entry above is already gone.
-        match Self::entry(server_id) {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(_) => Err("Session credential cleared, but OS deletion failed.".into()),
-            },
-            Err(_) => Ok(()),
+        // The session entry above is already gone. The OS entry is
+        // best-effort: when no OS credential exists (or no OS store is
+        // available at all) there is nothing to delete, so only a failed
+        // delete of an entry that actually exists is reported.
+        let Ok(entry) = Self::entry(server_id) else {
+            return Ok(());
+        };
+        if entry.get_password().is_err() {
+            return Ok(());
+        }
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("Session credential cleared, but OS deletion failed.".into()),
         }
     }
 }
