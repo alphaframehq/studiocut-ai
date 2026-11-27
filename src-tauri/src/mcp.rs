@@ -493,7 +493,7 @@ impl HttpClient {
         let response = builder
             .json(request)
             .send()
-            .map_err(|_| "MCP server connection failed or timed out".into())?;
+            .map_err(|_| "MCP server connection failed or timed out".to_string())?;
         if let Some(session) = response
             .headers()
             .get("mcp-session-id")
@@ -1099,7 +1099,7 @@ fn higgsfield_get(key: &Zeroizing<String>, url: &str) -> Result<Value, String> {
         .get(url)
         .header(reqwest::header::AUTHORIZATION, higgsfield_auth_header(key)?)
         .send()
-        .map_err(|_| "Higgsfield request failed or timed out".into())?;
+        .map_err(|_| "Higgsfield request failed or timed out".to_string())?;
     if response.status().as_u16() == 401 {
         return Err(
             "Higgsfield rejected the credential (HTTP 401). Check the KEY_ID:KEY_SECRET pair."
@@ -1140,7 +1140,7 @@ pub fn higgsfield_submit(
         .header(reqwest::header::AUTHORIZATION, higgsfield_auth_header(key)?)
         .json(&params)
         .send()
-        .map_err(|_| "Higgsfield request failed or timed out".into())?;
+        .map_err(|_| "Higgsfield request failed or timed out".to_string())?;
     if response.status().as_u16() == 401 {
         return Err(
             "Higgsfield rejected the credential (HTTP 401). Check the KEY_ID:KEY_SECRET pair."
@@ -1223,7 +1223,7 @@ pub fn higgsfield_cancel(key: &Zeroizing<String>, request_id: &str) -> Result<()
         ))
         .header(reqwest::header::AUTHORIZATION, higgsfield_auth_header(key)?)
         .send()
-        .map_err(|_| "Higgsfield request failed or timed out".into())?;
+        .map_err(|_| "Higgsfield request failed or timed out".to_string())?;
     if response.status().as_u16() == 401 {
         return Err(
             "Higgsfield rejected the credential (HTTP 401). Check the KEY_ID:KEY_SECRET pair."
@@ -1291,11 +1291,11 @@ pub fn download_result(
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(15))
         .build()
-        .map_err(|_| "Cannot initialize secure HTTP client".into())?;
+        .map_err(|_| "Cannot initialize secure HTTP client".to_string())?;
     let mut response = client
         .get(parsed)
         .send()
-        .map_err(|_| "Result download failed or timed out".into())?;
+        .map_err(|_| "Result download failed or timed out".to_string())?;
     if !response.status().is_success() {
         return Err(format!(
             "Result download returned HTTP {}. The link may have expired.",
@@ -1325,7 +1325,7 @@ pub fn download_result(
     }
     let mut staging = tempfile::NamedTempFile::new_in(&dir).map_err(|e| e.to_string())?;
     let copied = std::io::copy(&mut response.take(MAX_DOWNLOAD_BYTES + 1), &mut staging)
-        .map_err(|_| "Result download was interrupted".into())?;
+        .map_err(|_| "Result download was interrupted".to_string())?;
     if copied > MAX_DOWNLOAD_BYTES {
         return Err("Result exceeds the 500 MB download limit".into());
     }

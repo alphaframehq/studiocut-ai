@@ -37,13 +37,13 @@ pub struct ScopeData {
     /// [`WAVEFORM_COLUMNS`] columns, left to right.
     pub waveform: Vec<[u8; 2]>,
     /// Luma histogram: 256 bins, one count per luma value.
-    pub histogram_luma: [u32; 256],
+    pub histogram_luma: Vec<u32>,
     /// Red histogram: [`HISTOGRAM_CHANNEL_BINS`] bins over 0-255.
-    pub histogram_red: [u32; HISTOGRAM_CHANNEL_BINS],
+    pub histogram_red: Vec<u32>,
     /// Green histogram: [`HISTOGRAM_CHANNEL_BINS`] bins over 0-255.
-    pub histogram_green: [u32; HISTOGRAM_CHANNEL_BINS],
+    pub histogram_green: Vec<u32>,
     /// Blue histogram: [`HISTOGRAM_CHANNEL_BINS`] bins over 0-255.
-    pub histogram_blue: [u32; HISTOGRAM_CHANNEL_BINS],
+    pub histogram_blue: Vec<u32>,
     /// Vectorscope density grid, row-major over Cb (horizontal) and Cr
     /// (vertical), [`VECTORSCOPE_CELLS`] x [`VECTORSCOPE_CELLS`] cells.
     pub vectorscope: Vec<u32>,
@@ -85,17 +85,17 @@ pub fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
 }
 
 /// Luma histogram (256 bins) for RGB24 pixel data of `width` x `height`.
-pub fn luma_histogram(pixels: &[u8], width: u32, height: u32) -> [u32; 256] {
+pub fn luma_histogram(pixels: &[u8], width: u32, height: u32) -> Vec<u32> {
     let mut histogram = [0u32; 256];
     let expected = width as usize * height as usize * 3;
     if pixels.len() < expected {
-        return histogram;
+        return histogram.to_vec();
     }
     for chunk in pixels[..expected].chunks_exact(3) {
         let (y, _, _) = rgb_to_ycbcr(chunk[0], chunk[1], chunk[2]);
         histogram[y as usize] += 1;
     }
-    histogram
+    histogram.to_vec()
 }
 
 /// Per-channel histograms with [`HISTOGRAM_CHANNEL_BINS`] bins each.
@@ -103,24 +103,20 @@ pub fn channel_histograms(
     pixels: &[u8],
     width: u32,
     height: u32,
-) -> (
-    [u32; HISTOGRAM_CHANNEL_BINS],
-    [u32; HISTOGRAM_CHANNEL_BINS],
-    [u32; HISTOGRAM_CHANNEL_BINS],
-) {
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut red = [0u32; HISTOGRAM_CHANNEL_BINS];
     let mut green = [0u32; HISTOGRAM_CHANNEL_BINS];
     let mut blue = [0u32; HISTOGRAM_CHANNEL_BINS];
     let expected = width as usize * height as usize * 3;
     if pixels.len() < expected {
-        return (red, green, blue);
+        return (red.to_vec(), green.to_vec(), blue.to_vec());
     }
     for chunk in pixels[..expected].chunks_exact(3) {
         red[(chunk[0] as usize * HISTOGRAM_CHANNEL_BINS) / 256] += 1;
         green[(chunk[1] as usize * HISTOGRAM_CHANNEL_BINS) / 256] += 1;
         blue[(chunk[2] as usize * HISTOGRAM_CHANNEL_BINS) / 256] += 1;
     }
-    (red, green, blue)
+    (red.to_vec(), green.to_vec(), blue.to_vec())
 }
 
 /// Waveform: per-column luma `[min, max]` for [`WAVEFORM_COLUMNS`]
@@ -226,7 +222,7 @@ pub fn analyze_scopes(
     let source_path = media::verified_source(asset)?;
     let source_time = clip.source_in as f64 / project.settings.fps as f64 + at_seconds;
     let max_bytes = sample_width as u64 * sample_height as u64 * 3;
-    let mut file = media::run(
+    let file = media::run(
         "ffmpeg",
         &[
             "-v",
