@@ -1292,7 +1292,7 @@ pub fn download_result(
         .connect_timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| "Cannot initialize secure HTTP client".to_string())?;
-    let mut response = client
+    let response = client
         .get(parsed)
         .send()
         .map_err(|_| "Result download failed or timed out".to_string())?;
