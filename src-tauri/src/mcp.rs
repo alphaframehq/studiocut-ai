@@ -1469,72 +1469,120 @@ pub fn preset_by_id(id: &str) -> Option<McpPreset> {
 /// `credentials.rs`: OS credential store (`keyring`, service
 /// `app.studiocut.mcp`, account = server id) or session-only memory.
 /// Keys are never written to project files or preferences.
+///
+/// Other features reuse this store under their own keyring service
+/// through [`McpCredentials::set_for_service`] and friends (API
+/// connections use service `app.studiocut.api-connections` with the
+/// connection id as the account), so no second secret store exists.
 #[derive(Default)]
 pub struct McpCredentials(Mutex<HashMap<String, Zeroizing<String>>>);
 
+/// Keyring service for MCP server keys.
+pub const MCP_KEYRING_SERVICE: &str = "app.studiocut.mcp";
+
 impl McpCredentials {
-    fn entry(server_id: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new("app.studiocut.mcp", server_id).map_err(|_| {
+    fn entry_for(service: &str, account: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(service, account).map_err(|_| {
             "OS credential storage unavailable; explicitly choose session-only storage".into()
         })
     }
 
-    pub fn set(&self, server_id: &str, key: String, storage: &str) -> Result<(), String> {
-        validate_server_id(server_id)?;
+    /// Session-map key for one service/account pair. The service
+    /// namespaces the account, so the same id under two services
+    /// never collides.
+    fn session_key(service: &str, account: &str) -> String {
+        format!("{service}:{account}")
+    }
+
+    /// Store a key under an explicit keyring service and account.
+    /// `storage` is `"os"` or `"session"`.
+    pub fn set_for_service(
+        &self,
+        service: &str,
+        account: &str,
+        key: String,
+        storage: &str,
+    ) -> Result<(), String> {
+        validate_server_id(account)?;
         let key = Zeroizing::new(key);
         validate_api_key(&key)?;
+        let session_key = Self::session_key(service, account);
         match storage {
             "os" => {
-                Self::entry(server_id)?.set_password(&key).map_err(|_| {
-                    "OS credential storage unavailable; explicitly choose session-only storage"
-                })?;
+                Self::entry_for(service, account)?
+                    .set_password(&key)
+                    .map_err(|_| {
+                        "OS credential storage unavailable; explicitly choose session-only storage"
+                    })?;
                 self.0
                     .lock()
                     .map_err(|_| "Credential lock unavailable")?
-                    .remove(server_id);
+                    .remove(&session_key);
             }
             "session" => {
                 self.0
                     .lock()
                     .map_err(|_| "Credential lock unavailable")?
-                    .insert(server_id.to_owned(), key);
+                    .insert(session_key, key);
             }
             _ => return Err("Credential storage must be \"os\" or \"session\"".into()),
         }
         Ok(())
     }
 
-    pub fn get(&self, server_id: &str) -> Result<Zeroizing<String>, String> {
-        validate_server_id(server_id)?;
+    /// Look up a key under an explicit keyring service and account:
+    /// session memory first, then the OS credential store. Returns
+    /// `Ok(None)` when no key is stored; only a lock failure is an
+    /// error.
+    fn get_for_service_inner(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<Zeroizing<String>>, String> {
+        validate_server_id(account)?;
         if let Some(key) = self
             .0
             .lock()
             .map_err(|_| "Credential lock unavailable")?
-            .get(server_id)
+            .get(&Self::session_key(service, account))
         {
-            return Ok(key.clone());
+            return Ok(Some(key.clone()));
         }
-        if let Ok(entry) = Self::entry(server_id) {
+        if let Ok(entry) = Self::entry_for(service, account) {
             if let Ok(key) = entry.get_password() {
-                return Ok(Zeroizing::new(key));
+                return Ok(Some(Zeroizing::new(key)));
             }
         }
-        Err(format!(
-            "No credential saved for server {server_id}. Save one in OS storage or explicitly select session-only."
-        ))
+        Ok(None)
     }
 
-    pub fn delete(&self, server_id: &str) -> Result<(), String> {
-        validate_server_id(server_id)?;
+    /// Resolve a key under an explicit keyring service and account.
+    pub fn get_for_service(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Zeroizing<String>, String> {
+        self.get_for_service_inner(service, account)?.ok_or_else(|| {
+            format!(
+                "No credential saved for {account}. Save one in OS storage or explicitly select session-only."
+            )
+        })
+    }
+
+    /// Forget a key under an explicit keyring service and account
+    /// (session memory and OS store). The OS deletion is best-effort
+    /// as in [`McpCredentials::delete`].
+    pub fn delete_for_service(&self, service: &str, account: &str) -> Result<(), String> {
+        validate_server_id(account)?;
         self.0
             .lock()
             .map_err(|_| "Credential lock unavailable")?
-            .remove(server_id);
+            .remove(&Self::session_key(service, account));
         // The session entry above is already gone. The OS entry is
         // best-effort: when no OS credential exists (or no OS store is
         // available at all) there is nothing to delete, so only a failed
         // delete of an entry that actually exists is reported.
-        let Ok(entry) = Self::entry(server_id) else {
+        let Ok(entry) = Self::entry_for(service, account) else {
             return Ok(());
         };
         if entry.get_password().is_err() {
@@ -1544,6 +1592,23 @@ impl McpCredentials {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err("Session credential cleared, but OS deletion failed.".into()),
         }
+    }
+
+    pub fn set(&self, server_id: &str, key: String, storage: &str) -> Result<(), String> {
+        self.set_for_service(MCP_KEYRING_SERVICE, server_id, key, storage)
+    }
+
+    pub fn get(&self, server_id: &str) -> Result<Zeroizing<String>, String> {
+        self.get_for_service_inner(MCP_KEYRING_SERVICE, server_id)?
+            .ok_or_else(|| {
+                format!(
+                    "No credential saved for server {server_id}. Save one in OS storage or explicitly select session-only."
+                )
+            })
+    }
+
+    pub fn delete(&self, server_id: &str) -> Result<(), String> {
+        self.delete_for_service(MCP_KEYRING_SERVICE, server_id)
     }
 }
 
