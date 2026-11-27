@@ -157,7 +157,7 @@ const BEDROCK_STATIC_NOTE: &str = "Bedrock needs AWS signing for a live list —
 const VERTEX_NOTE: &str =
     "Vertex model list needs a project-scoped API call — paste the full model path";
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ModelsAuth {
     Bearer,
     GoogApiKey,
@@ -716,12 +716,9 @@ mod tests {
             {"id":"gpt-4o-audio-preview"},
             {"id":"o1-preview"},
         ]});
-        let kept: Vec<&str> = filter_director_models(&value, "openai")
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(kept, vec!["gpt-4o", "gpt-4o-mini", "o1-preview"]);
         let models = filter_director_models(&value, "openai");
+        let kept: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(kept, vec!["gpt-4o", "gpt-4o-mini", "o1-preview"]);
         assert!(
             models
                 .iter()
@@ -747,10 +744,8 @@ mod tests {
             {"id":"qwen/qwen-2.5-72b-instruct"},
             {"id":"mystery/image-gen-1","architecture":{"modality":"text->image"}},
         ]});
-        let kept: Vec<&str> = filter_director_models(&value, "openrouter")
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
+        let models = filter_director_models(&value, "openrouter");
+        let kept: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(kept.contains(&"openai/gpt-4o"));
         assert!(kept.contains(&"meta-llama/llama-3.3-70b-instruct"));
         assert!(kept.contains(&"qwen/qwen-2.5-72b-instruct"));
@@ -765,10 +760,8 @@ mod tests {
             {"name":"models/embedding-001","supportedGenerationMethods":["embedContent"]},
             {"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent","countTokens"]},
         ]});
-        let kept: Vec<&str> = filter_gemini_models(&value)
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
+        let models = filter_gemini_models(&value);
+        let kept: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(kept, vec!["gemini-2.5-flash", "gemini-2.5-pro"]);
     }
     #[test]
@@ -777,10 +770,8 @@ mod tests {
             {"name":"llama3.3:70b"},
             {"name":"qwen2.5:72b"},
         ]});
-        let kept: Vec<&str> = filter_ollama_models(&value)
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
+        let models = filter_ollama_models(&value);
+        let kept: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(kept, vec!["llama3.3:70b", "qwen2.5:72b"]);
     }
     #[test]

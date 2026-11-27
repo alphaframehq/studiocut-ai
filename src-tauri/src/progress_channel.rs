@@ -62,7 +62,7 @@ pub struct ReaderPermit<'a>(&'a AtomicUsize);
 impl ReaderLimit {
     pub fn acquire(&self) -> Result<ReaderPermit<'_>, String> {
         self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_CONCURRENT_READERS).then_some(n + 1)
             })
             .map_err(|_| "Too many concurrent export progress readers".to_string())?;
