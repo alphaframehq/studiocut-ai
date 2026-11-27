@@ -82,7 +82,7 @@ fn real_scene_detection_finds_hard_cut_and_scores_shots() {
         .status()
         .unwrap()
         .success());
-    let asset = media::import_media(&root.join("cache"), &input).unwrap();
+    let asset = media::import_media(&root.path().join("cache"), &input).unwrap();
     assert!(asset.video_stream.is_some());
     let mut project = create_project("Scene roundtrip".into(), 1920, 1080, 30).unwrap();
     project.schema_version = 3;
