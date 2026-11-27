@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { useProject } from './store';
-import { getEncoderPreference } from './preferences';
+import { getEncoderPreference, getStyleDna } from './preferences';
 import './finishing.css';
 type Job = { version: 1; id: string; sequence: number; timestamp: number; state: string; progress: number; encoder: string | null; disclosure: string; output: string; error: string | null };
 const active = (job: Job | null) => !!job && ['probing', 'rendering', 'validating'].includes(job.state);
@@ -19,9 +19,10 @@ export function ExportModal({ hidden = false }: { hidden?: boolean }) {
   const [open, setOpen] = useState(false), [pending, setPending] = useState(false), [job, setJob] = useState<Job | null>(null), [error, setError] = useState('');
   const [container, setContainer] = useState('mp4'), [height, setHeight] = useState(1080), [fps, setFps] = useState(30), [encoder, setEncoder] = useState<string>(getEncoderPreference), [output, setOutput] = useState('');
   const [aspect, setAspect] = useState('landscape'), [fill, setFill] = useState('fit'), [preset, setPreset] = useState<string>('youtube');
-  // Re-read the Settings preference every time the dialog opens, so a
-  // change made in Settings while this dialog was closed still applies.
-  useEffect(() => { if (open) setEncoder(getEncoderPreference()); }, [open]);
+  // Re-read the Settings preferences every time the dialog opens, so a
+  // change made in Settings while this dialog was closed still applies —
+  // including a saved Style DNA (aspect/fill).
+  useEffect(() => { if (open) { setEncoder(getEncoderPreference()); const dna = getStyleDna(); setAspect(dna.aspect); setFill(dna.fill); setPreset(dna.aspect === 'vertical' ? 'shorts' : dna.aspect === 'square' ? 'custom' : 'youtube'); } }, [open]);
   useEffect(() => {
     if (!open || !isTauri()) return;
     let stopped = false, timer: ReturnType<typeof setTimeout>, failures = 0;

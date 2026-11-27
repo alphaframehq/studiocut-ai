@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Pause, Play, Scissors, Undo2, Redo2, Plus, Trash2 } from 'lucide-react';
 import { useProject } from './store';
-import { timelineEnd, type Clip, type Track } from './timeline';
+import { newId, timelineEnd, type Clip, type Track } from './timeline';
 
 export function Timeline() {
-  const { project, frame, selected, playing, busy, history, edit, undo, seek, addMarker, removeMarker } = useProject();
+  const { project, frame, selected, playing, busy, history, edit, undo, seek, addMarker, removeMarker, applyAnalysis, replaceTracks } = useProject();
   const [razor, setRazor] = useState(false);
   const [zoom, setZoom] = useState(36);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -110,6 +110,8 @@ export function Timeline() {
       <button aria-label="Razor tool" aria-pressed={razor} onClick={() => setRazor(!razor)}><Scissors size={15} /> Razor</button>
       <button disabled={!clip || busy || (clip && isLocked(clip))} onClick={() => selected && void edit({ type: 'split', clipId: selected, frame: Math.round(frame) })}>Split at playhead</button>
       <button aria-label="Delete selected clip" disabled={!clip || busy || (clip && isLocked(clip))} onClick={() => selected && void edit({ type: 'remove', clipId: selected })}><Trash2 size={15} /></button>
+      <button disabled={!clip || busy || (clip && isLocked(clip))} title="Delete the selected clip and ripple-close the gap across all tracks (one undo)" onClick={() => clip && void applyAnalysis({ type: 'cuts', cuts: [{ start: clip.start, end: clip.start + clip.duration }] }, project.id, project.revision)}>Ripple-cut selection</button>
+      <button disabled={busy} title="Append an empty caption track (project v6)" onClick={() => void replaceTracks([...project.tracks, { id: newId(), name: 'Captions', kind: 'caption', muted: false, solo: false, locked: false, clips: [] }], project.id, project.revision)}><Plus size={14} /> Caption track</button>
       <button disabled={busy || !end} onClick={zoomToFit}>Zoom to fit</button>
       <button disabled={busy} onClick={() => void addMarker(frame)}>+ Marker</button>
       <button disabled={busy} onClick={() => void edit({ type: 'addTrack', kind: 'video' })}><Plus size={14} /> Video track</button>

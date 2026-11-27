@@ -5,7 +5,7 @@ export type Asset = {
   id: string; sourcePath: string; name: string; sizeBytes: number; modifiedNs: string;
   kind: 'video' | 'audio' | 'image'; duration: number | null; width: number | null; height: number | null;
   fps: number | null; videoStream: number | null; audioStream: number | null;
-  videoCodec: string | null; audioCodec: string | null; sampleRate: number | null; channels: number | null; createdAt: number;
+  videoCodec: string | null; audioCodec: string | null; sampleRate: number | null; channels: number | null; createdAt: number; bin: string;
 };
 export type Marker = { id: string; frame: number; label: string };
 export type Project = {
@@ -44,7 +44,9 @@ export function validateProject(value: unknown): Project {
   }
   const ids = new Set<string>();
   for (const a of p.assets) {
-    if (!a || typeof a !== 'object' || !uuid(a.id) || ids.has(a.id) || typeof a.sourcePath !== 'string' || !a.sourcePath || a.sourcePath.includes('\0') || typeof a.name !== 'string' || !a.name || !uint(a.sizeBytes) || a.sizeBytes === 0 || !uint(a.createdAt) || typeof a.modifiedNs !== 'string' || !/^\d+$/.test(a.modifiedNs) || BigInt(a.modifiedNs) > (1n << 128n) - 1n || !['video', 'audio', 'image'].includes(a.kind)
+    // Bins are optional in older files: missing means Unsorted ("").
+    if (a.bin === undefined) a.bin = '';
+    if (!a || typeof a !== 'object' || !uuid(a.id) || ids.has(a.id) || typeof a.sourcePath !== 'string' || !a.sourcePath || a.sourcePath.includes('\0') || typeof a.name !== 'string' || !a.name || typeof a.bin !== 'string' || a.bin.includes('\0') || a.bin.length > 80 || !uint(a.sizeBytes) || a.sizeBytes === 0 || !uint(a.createdAt) || typeof a.modifiedNs !== 'string' || !/^\d+$/.test(a.modifiedNs) || BigInt(a.modifiedNs) > (1n << 128n) - 1n || !['video', 'audio', 'image'].includes(a.kind)
       || (a.duration !== null && (!Number.isFinite(a.duration) || a.duration <= 0 || a.duration > 21600))
       || (a.fps !== null && (!Number.isFinite(a.fps) || a.fps < 0))
       || [a.width, a.height, a.sampleRate, a.channels].some(n => n !== null && (!uint(n) || n === 0 || n > 4294967295))
@@ -52,7 +54,7 @@ export function validateProject(value: unknown): Project {
       || [a.videoCodec, a.audioCodec].some(n => n !== null && typeof n !== 'string')
       || (a.videoStream === null && a.audioStream === null) || (a.kind === 'audio' && a.audioStream === null)
       || (a.kind !== 'audio' && (a.videoStream === null || a.width === null || a.height === null)) || (a.kind !== 'image' && a.duration === null)
-      || !keys(a, ['id', 'sourcePath', 'name', 'sizeBytes', 'modifiedNs', 'kind', 'duration', 'width', 'height', 'fps', 'videoStream', 'audioStream', 'videoCodec', 'audioCodec', 'sampleRate', 'channels', 'createdAt'])) throw new Error('Invalid media metadata.');
+      || !keys(a, ['id', 'sourcePath', 'name', 'sizeBytes', 'modifiedNs', 'kind', 'duration', 'width', 'height', 'fps', 'videoStream', 'audioStream', 'videoCodec', 'audioCodec', 'sampleRate', 'channels', 'createdAt', 'bin'])) throw new Error('Invalid media metadata.');
     ids.add(a.id);
   }
   const trackIds = new Set<string>();

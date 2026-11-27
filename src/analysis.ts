@@ -3,6 +3,11 @@ import { newId, sourceOffset, timelineEnd, type CaptionPreset, type CaptionWord,
 
 export type Cut = { start: number; end: number };
 export type Transcript = { timing: 'word' | 'segment'; items: { text: string; start: number; end: number }[] };
+/** One detected shot, clip-relative seconds. `score` is a heuristic luma estimate, not ML. */
+export type Scene = { start: number; end: number; score: number | null };
+/** A scene expressed in timeline frames, as the rough-cut IPC takes it. */
+export type SceneCut = { start: number; end: number; score: number | null };
+export type RoughCut = { cuts: Cut[]; hook: Cut | null };
 
 export function rippleDelete(project: Project, cuts: Cut[]): Project {
   const end = timelineEnd(project.tracks);

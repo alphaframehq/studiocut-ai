@@ -21,6 +21,13 @@ export function Preview() {
   const asset = project?.assets.find(a => a.id === active?.assetId);
   const zoom = zoomAt(active?.effects?.zoom ?? [], frame - (active?.start ?? 0) + (active?.sourceIn ?? 0));
   const transform = { transform: `scale(${zoom.scale})`, transformOrigin: `${zoom.x * 100}% ${zoom.y * 100}%` };
+  // CSS-filter approximation of the finishing grade (brightness/contrast/
+  // saturation) on the media element only — the LUT canvas overlay is a
+  // sibling and is not filtered. Approximation only: the exact grade is
+  // applied by FFmpeg on export.
+  const finishing = active?.effects?.finishing;
+  const grade = finishing && (finishing.brightness !== 0 || finishing.contrast !== 1 || finishing.saturation !== 1)
+    ? `brightness(${1 + finishing.brightness}) contrast(${finishing.contrast}) saturate(${finishing.saturation})` : '';
   const captions = project?.tracks.filter(t => t.kind === 'caption' && audible(t, project.tracks)).flatMap(t => t.clips).filter(c => frame >= c.start && frame < c.start + c.duration) ?? [];
   useEffect(() => {
     let cancelled = false;
@@ -50,7 +57,7 @@ export function Preview() {
     return () => element.removeEventListener('loadedmetadata', synchronize);
   }, [frame, playing, active, project, url]);
   return <section className="preview-player" aria-label="Program preview"><div className="preview-heading"><span>PROGRAM MONITOR</span><span>{project?.settings.width} × {project?.settings.height}</span></div><div className="preview-screen">
-    {sourceError ? <p role="alert">{sourceError}</p> : asset && url ? <div className="effect-stage" style={transform}>{asset.kind === 'image' ? <img ref={image} src={url} alt={asset.name} /> : <video ref={video} src={url} muted playsInline preload="auto" onError={() => { setSourceError('This video codec is not supported by this WebView. Use an H.264 MP4 or WebM source.'); useProject.setState({ playing: false }); }} />}{active?.effects?.lut && <EffectPreview key={`${url}:${active.effects.lut}`} source={asset.kind === 'image' ? image : video} image={asset.kind === 'image'} preset={active.effects.lut} frame={frame} />}</div> : <div className="preview-empty"><span>{asset ? 'Loading source…' : 'StudioCut'}</span><p>{project && timelineEnd(project.tracks) ? 'No visible video at the playhead' : 'Add a clip to begin your edit'}</p></div>}
+    {sourceError ? <p role="alert">{sourceError}</p> : asset && url ? <div className="effect-stage" style={transform}>{asset.kind === 'image' ? <img ref={image} src={url} alt={asset.name} style={grade ? { filter: grade } : undefined} /> : <video ref={video} src={url} muted playsInline preload="auto" style={grade ? { filter: grade } : undefined} onError={() => { setSourceError('This video codec is not supported by this WebView. Use an H.264 MP4 or WebM source.'); useProject.setState({ playing: false }); }} />}{active?.effects?.lut && <EffectPreview key={`${url}:${active.effects.lut}`} source={asset.kind === 'image' ? image : video} image={asset.kind === 'image'} preset={active.effects.lut} frame={frame} />}</div> : <div className="preview-empty"><span>{asset ? 'Loading source…' : 'StudioCut'}</span><p>{project && timelineEnd(project.tracks) ? 'No visible video at the playhead' : 'Add a clip to begin your edit'}</p></div>}
     {captions.map(c => <div key={c.id} className={`caption-overlay caption-${c.caption!.preset}`} aria-label="Captions">{c.caption!.words.filter(w => w.end > c.sourceIn && w.start < c.sourceIn + c.duration).map((word, i) => <span key={i} className={frame - c.start + c.sourceIn >= word.start && frame - c.start + c.sourceIn < word.end ? 'active-word' : ''}>{word.text}</span>)}</div>)}
-  </div><div className="preview-footer"><span>{active ? asset?.name : 'Black / silence through timeline gaps'}</span><span>{playing ? 'Playing · audio clock' : 'Paused'}</span></div></section>;
+  </div><div className="preview-footer"><span>{active ? asset?.name : 'Black / silence through timeline gaps'}</span>{grade && <span>Grade preview is approximate — exact grade applies on export</span>}<span>{playing ? 'Playing · audio clock' : 'Paused'}</span></div></section>;
 }
