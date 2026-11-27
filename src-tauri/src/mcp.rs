@@ -1669,6 +1669,7 @@ pub struct OAuthTokenSummary {
     pub scope: Option<String>,
 }
 
+#[derive(Debug)]
 struct OAuthTokenResponse {
     access_token: Zeroizing<String>,
     token_type: String,
@@ -3404,7 +3405,10 @@ mod tests {
         assert_eq!(&*parsed.access_token, "tok-1");
         assert_eq!(parsed.token_type, "Bearer");
         assert_eq!(parsed.expires_in, Some(3600));
-        assert_eq!(parsed.refresh_token.as_deref(), Some("ref-1"));
+        assert_eq!(
+            parsed.refresh_token.as_deref().map(String::as_str),
+            Some("ref-1")
+        );
         assert_eq!(parsed.scope.as_deref(), Some("openid email offline_access"));
         // A response without an access token is an error, and the
         // error never echoes the body.
