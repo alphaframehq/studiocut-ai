@@ -3,8 +3,13 @@
 //! The client speaks MCP over two transports: Streamable HTTP for remote
 //! servers and stdio for local servers. It also provides a REST client for
 //! the Higgsfield API, which is the primary generation path for that
-//! preset (its hosted MCP server requires browser OAuth, which this
-//! desktop client does not implement).
+//! preset. The hosted Higgsfield MCP server signs in with browser OAuth;
+//! the client-side authorization-code flow with PKCE for that server
+//! (endpoint discovery, dynamic client registration, authorization URL,
+//! code exchange, token refresh) is implemented in the Higgsfield OAuth
+//! section below, but it is untested end to end: completing it needs a
+//! Higgsfield account sign-in in a browser, and the app has no redirect
+//! receiver, so the authorization code must be pasted back by hand.
 //!
 //! # Implementation decision: minimal JSON-RPC client, not the `rmcp` SDK
 //!
@@ -47,8 +52,10 @@
 //! video CLI (whose hosted MCP endpoint is mcp.heygen.com and uses
 //! OAuth).
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
@@ -59,6 +66,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// MCP protocol version negotiated at `initialize`.
@@ -635,6 +643,300 @@ fn validate_tool_name(tool: &str) -> Result<(), String> {
             .all(|c| c.is_ascii_alphanumeric() || ['_', '-', '.'].contains(&c))
     {
         return Err("Tool name must be 1–128 letters, digits, underscore, hyphen, or dot".into());
+    }
+    Ok(())
+}
+
+// --- Tool parameter forms -------------------------------------------------
+//
+// The parameter form is built from the live `tools/list` response, not
+// from parameter names written in this codebase. A tool's `inputSchema`
+// is a JSON Schema object; `form_fields_from_schema` converts its
+// `properties` into form fields, and `validate_arguments_against_schema`
+// checks the assembled arguments against the same schema before the
+// call is sent. When a server reports no schema (or no properties),
+// the panel falls back to the free-form JSON editor. Field order is
+// alphabetical: `serde_json` without the `preserve_order` feature
+// stores object keys sorted, so the server's original property order
+// does not survive deserialization.
+//
+// HyperFrames parameter names are documented on the vendor page
+// (hyperframes.net/hyperframes-mcp, updated 6 November 2026, checked
+// 27 November 2026: `generate_video` takes `prompt` plus optional
+// `image_url`, `video_urls`, `scene`, `duration_seconds`, `resolution`,
+// `fast`, `aspect_ratio`, `generate_audio`, `web_search`, `seed`). Those
+// names are NOT hard-coded into the form: they arrive through the live
+// schema. `validate_hyperframes_arguments` only enforces the documented
+// limits (prompt of at most 4,000 characters; video of 4–15 seconds at
+// 480p or 720p; images at 1K or 2K) as a second check. The first live
+// `generate_video` call built from these fields has not been tested in
+// this environment, because no HyperFrames API key is available here.
+
+/// One field of a schema-driven tool parameter form.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormField {
+    pub name: String,
+    /// JSON Schema type: `string`, `number`, `integer`, `boolean`,
+    /// `array`, or `object`. Unknown or absent types render as `string`.
+    pub field_type: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// Element type for `array` fields, when the schema states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_type: Option<String>,
+}
+
+fn schema_type_of(property: &Value) -> String {
+    match property.get("type").and_then(Value::as_str) {
+        Some("string") | Some("number") | Some("integer") | Some("boolean") | Some("array")
+        | Some("object") => property["type"].as_str().unwrap().to_owned(),
+        _ => {
+            // A schema with an `enum` but no `type` still constrains the
+            // value; infer the field type from its first option.
+            if let Some(first) = property
+                .get("enum")
+                .and_then(Value::as_array)
+                .and_then(|e| e.first())
+            {
+                if first.is_string() {
+                    return "string".into();
+                }
+                if first.is_boolean() {
+                    return "boolean".into();
+                }
+                if first.is_number() {
+                    return "number".into();
+                }
+            }
+            "string".into()
+        }
+    }
+}
+
+/// Convert a tool `inputSchema` (JSON Schema) into form fields. A
+/// schema without an object `properties` map yields no fields, and the
+/// caller falls back to the free-form JSON editor.
+pub fn form_fields_from_schema(schema: &Value) -> Vec<FormField> {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<&str>>()
+        })
+        .unwrap_or_default();
+    properties
+        .iter()
+        .filter_map(|(name, property)| {
+            if name.is_empty() || name.len() > 128 {
+                return None;
+            }
+            Some(FormField {
+                name: name.clone(),
+                field_type: schema_type_of(property),
+                title: property
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                description: property
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                required: required.contains(name.as_str()),
+                default: property.get("default").cloned(),
+                enum_values: property
+                    .get("enum")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                minimum: property.get("minimum").and_then(Value::as_f64),
+                maximum: property.get("maximum").and_then(Value::as_f64),
+                min_length: property.get("minLength").and_then(Value::as_u64),
+                max_length: property.get("maxLength").and_then(Value::as_u64),
+                items_type: property
+                    .get("items")
+                    .and_then(|items| items.get("type"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn value_matches_type(value: &Value, field_type: &str) -> bool {
+    match field_type {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => match value {
+            Value::Number(n) => {
+                n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
+            }
+            _ => false,
+        },
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    }
+}
+
+/// Check assembled tool arguments against the tool's `inputSchema`.
+/// Required fields must be present and non-null; present values must
+/// match the declared type, fall inside any `minimum`/`maximum` or
+/// `minLength`/`maxLength`, and belong to `enum` when one is given.
+/// Keys the schema does not describe are allowed: a server may accept
+/// optional parameters its schema omits.
+pub fn validate_arguments_against_schema(schema: &Value, arguments: &Value) -> Result<(), String> {
+    let arguments = arguments
+        .as_object()
+        .ok_or("Tool arguments must be a JSON object")?;
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for name in required.iter().filter_map(Value::as_str) {
+            match arguments.get(name) {
+                None | Some(Value::Null) => {
+                    return Err(format!("Parameter \"{name}\" is required"));
+                }
+                _ => {}
+            }
+        }
+    }
+    for (name, value) in arguments {
+        let Some(property) = properties.get(name) else {
+            continue;
+        };
+        let field_type = schema_type_of(property);
+        if !value_matches_type(value, &field_type) {
+            return Err(format!("Parameter \"{name}\" must be a {field_type}"));
+        }
+        if let Some(options) = property.get("enum").and_then(Value::as_array) {
+            if !options.iter().any(|option| option == value) {
+                return Err(format!(
+                    "Parameter \"{name}\" must be one of the values offered by the server"
+                ));
+            }
+        }
+        if let Some(number) = value.as_f64() {
+            if let Some(minimum) = property.get("minimum").and_then(Value::as_f64) {
+                if number < minimum {
+                    return Err(format!("Parameter \"{name}\" must be at least {minimum}"));
+                }
+            }
+            if let Some(maximum) = property.get("maximum").and_then(Value::as_f64) {
+                if number > maximum {
+                    return Err(format!("Parameter \"{name}\" must be at most {maximum}"));
+                }
+            }
+        }
+        if let Some(text) = value.as_str() {
+            let length = text.chars().count() as u64;
+            if let Some(min) = property.get("minLength").and_then(Value::as_u64) {
+                if length < min {
+                    return Err(format!(
+                        "Parameter \"{name}\" must be at least {min} characters"
+                    ));
+                }
+            }
+            if let Some(max) = property.get("maxLength").and_then(Value::as_u64) {
+                if length > max {
+                    return Err(format!(
+                        "Parameter \"{name}\" must be at most {max} characters"
+                    ));
+                }
+            }
+        }
+        if field_type == "array" {
+            if let (Some(items), Some(elements)) = (
+                property
+                    .get("items")
+                    .and_then(|i| i.get("type"))
+                    .and_then(Value::as_str),
+                value.as_array(),
+            ) {
+                for element in elements {
+                    if !value_matches_type(element, items) {
+                        return Err(format!(
+                            "Parameter \"{name}\" must contain only {items} values"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Maximum HyperFrames prompt length in characters, as documented on
+/// the vendor page (hyperframes.net/hyperframes-mcp, 6 November 2026).
+pub const HYPERFRAMES_MAX_PROMPT_CHARS: usize = 4000;
+
+/// Enforce the HyperFrames limits documented on the vendor page for
+/// `generate_video` and `generate_image`. Other tools are unaffected.
+/// This is a second check on top of the live schema validation: it
+/// applies only when the named parameter is present, and it never
+/// invents a parameter — every name here is documented on that page.
+pub fn validate_hyperframes_arguments(tool: &str, arguments: &Value) -> Result<(), String> {
+    if tool != "generate_video" && tool != "generate_image" {
+        return Ok(());
+    }
+    let arguments = arguments
+        .as_object()
+        .ok_or("Tool arguments must be a JSON object")?;
+    let prompt = arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or("Parameter \"prompt\" is required")?;
+    if prompt.trim().is_empty() {
+        return Err("Parameter \"prompt\" must not be empty".into());
+    }
+    if prompt.chars().count() > HYPERFRAMES_MAX_PROMPT_CHARS {
+        return Err(format!(
+            "Parameter \"prompt\" must be at most {HYPERFRAMES_MAX_PROMPT_CHARS} characters"
+        ));
+    }
+    if let Some(duration) = arguments.get("duration_seconds") {
+        let seconds = duration
+            .as_f64()
+            .ok_or("Parameter \"duration_seconds\" must be a number of seconds")?;
+        if seconds.fract() != 0.0 || !(4.0..=15.0).contains(&seconds) {
+            return Err(
+                "Parameter \"duration_seconds\" must be a whole number from 4 to 15".into(),
+            );
+        }
+    }
+    if let Some(resolution) = arguments.get("resolution").and_then(Value::as_str) {
+        let allowed: &[&str] = if tool == "generate_video" {
+            &["480p", "720p"]
+        } else {
+            &["1K", "2K"]
+        };
+        if !allowed.contains(&resolution) {
+            return Err(format!(
+                "Parameter \"resolution\" must be one of {} for {tool}",
+                allowed.join(", ")
+            ));
+        }
     }
     Ok(())
 }
@@ -1239,6 +1541,645 @@ pub fn higgsfield_cancel(key: &Zeroizing<String>, request_id: &str) -> Result<()
     Ok(())
 }
 
+// --- Higgsfield hosted MCP (OAuth) ----------------------------------------
+//
+// The hosted Higgsfield MCP server authenticates with OAuth, not an API
+// key. This section implements the client side of that flow, following
+// the MCP OAuth discovery sequence (RFC 9728 protected-resource
+// metadata, RFC 8414 authorization-server metadata, RFC 7591 dynamic
+// client registration, authorization code with PKCE per RFC 7636, and
+// refresh tokens). No new crates are used: HTTP goes through the
+// existing `reqwest` blocking client, PKCE uses the existing `sha2` and
+// `base64` crates, and the PKCE verifier is built from `Uuid` v4 values
+// (already a dependency).
+//
+// What was verified live on 27 November 2026 (public metadata, no
+// account, no credentials):
+// - GET https://mcp.higgsfield.ai/.well-known/oauth-protected-resource
+//   returns resource `https://mcp.higgsfield.ai/mcp`, authorization
+//   server `https://higgsfield.ai/_clerk`, scopes `openid`, `email`,
+//   `offline_access`, and an `higgsfield_auth_hints` block stating that
+//   clients able to complete a redirect use authorization-code + PKCE.
+// - GET https://mcp.higgsfield.ai/.well-known/oauth-authorization-server
+//   returns issuer `https://mcp.higgsfield.ai`, authorization endpoint
+//   `https://mcp.higgsfield.ai/oauth2/authorize`, token endpoint
+//   `https://mcp.higgsfield.ai/oauth2/token`, registration endpoint
+//   `https://mcp.higgsfield.ai/oauth2/register`,
+//   `client_id_metadata_document_supported: true`, response types
+//   `["code"]`, response modes `["form_post", "query"]`, grant types
+//   `["authorization_code", "refresh_token",
+//   "urn:ietf:params:oauth:grant-type:device_code"]`, token endpoint
+//   auth methods `["client_secret_basic", "none", "client_secret_post"]`,
+//   code challenge methods `["S256"]`, and the same three scopes.
+//   Note the two documents disagree about where the authorization
+//   server lives (Clerk in the protected-resource document, the MCP
+//   host in the authorization-server document). The endpoints from the
+//   authorization-server document are authoritative for this flow,
+//   because that is the document a client fetches to learn them.
+// - The authorization-server document also reports support for client
+//   ID metadata documents. Whether dynamic client registration remains
+//   accepted is unverified: if the server stops accepting registered
+//   clients, registration fails here with the server's error, and the
+//   panel reports it instead of claiming success.
+//
+// What is NOT implemented, and why the flow is untested end to end:
+// - The app has no redirect receiver (no local HTTP listener) and no
+//   browser-opener plugin, so after sign-in the browser lands on a
+//   loopback address nothing listens on. The user copies the
+//   authorization code from the browser address bar and pastes it into
+//   the panel (response mode `query` is supported by the server). A
+//   loopback listener is the remaining work to make this one click.
+// - The sign-in itself needs a Higgsfield account in a browser. No
+//   account, client registration, or token exchange has been performed
+//   in this environment, and no token has ever been issued to this app.
+// - The protected-resource hints name specific clients for the redirect
+//   flow (`anthropic`, `claude`, `claude-ai`, `claude-code`,
+//   `openclaw`, `hermes`). StudioCut AI is not among them, so whether
+//   the authorization server accepts a dynamically registered client
+//   from this app is unverified.
+//
+// Token storage reuses the existing credential pattern: the access
+// token is stored under the MCP server entry's id, so the existing
+// credential resolution finds it for `mcp_test_connection` and
+// `mcp_call_tool`; the refresh token is stored under
+// `{server_id}-refresh`. Tokens are never logged, and the token
+// exchange command returns only a summary (token type, expiry,
+// whether a refresh token was issued), never the token values.
+
+/// OAuth scopes requested from the Higgsfield authorization server.
+pub const HIGGSFIELD_OAUTH_SCOPES: &str = "openid email offline_access";
+/// Protected-resource metadata document for the hosted MCP server.
+pub const HIGGSFIELD_OAUTH_PROTECTED_RESOURCE_URL: &str =
+    "https://mcp.higgsfield.ai/.well-known/oauth-protected-resource";
+/// Authorization-server metadata document for the hosted MCP server.
+pub const HIGGSFIELD_OAUTH_AUTHORIZATION_SERVER_URL: &str =
+    "https://mcp.higgsfield.ai/.well-known/oauth-authorization-server";
+/// Client name sent at dynamic client registration.
+pub const OAUTH_CLIENT_NAME: &str = "StudioCut AI";
+
+/// Discovered Higgsfield OAuth endpoints and capabilities.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthDiscovery {
+    pub resource: String,
+    pub authorization_servers: Vec<String>,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub registration_endpoint: Option<String>,
+    pub scopes_supported: Vec<String>,
+    pub code_challenge_methods_supported: Vec<String>,
+    pub client_id_metadata_document_supported: bool,
+    pub grant_types_supported: Vec<String>,
+    pub response_types_supported: Vec<String>,
+}
+
+/// A dynamically registered OAuth client. The secret, when issued, is
+/// held in panel memory for the session and passed back to the token
+/// commands; it is never written to project files or preferences.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthClientRegistration {
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id_issued_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_expires_at: Option<i64>,
+}
+
+/// A PKCE pair: the verifier the panel keeps in memory, and the S256
+/// challenge sent in the authorization URL.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkcePair {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+/// What the panel is told about an issued token. Token values are
+/// never returned to the frontend; they go straight into credential
+/// storage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthTokenSummary {
+    pub token_type: String,
+    pub expires_in: Option<u64>,
+    pub has_refresh_token: bool,
+    pub scope: Option<String>,
+}
+
+struct OAuthTokenResponse {
+    access_token: Zeroizing<String>,
+    token_type: String,
+    expires_in: Option<u64>,
+    refresh_token: Option<Zeroizing<String>>,
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProtectedResourceMetadata {
+    resource: String,
+    #[serde(default)]
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct AuthorizationServerMetadata {
+    #[allow(dead_code)]
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    #[serde(default)]
+    registration_endpoint: Option<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    client_id_metadata_document_supported: bool,
+    #[serde(default)]
+    grant_types_supported: Vec<String>,
+    #[serde(default)]
+    response_types_supported: Vec<String>,
+}
+
+/// Validate an OAuth endpoint URL: HTTPS, no credentials, query, or
+/// fragment. Authorization, token, and registration endpoints must all
+/// pass this check.
+fn validate_oauth_endpoint(raw: &str) -> Result<reqwest::Url, String> {
+    let url = validate_remote_url(raw).map_err(|_| {
+        "OAuth endpoint must be an HTTPS URL without credentials, query, or fragment"
+    })?;
+    if url.scheme() != "https" {
+        return Err("OAuth endpoint must use HTTPS".into());
+    }
+    Ok(url)
+}
+
+/// Validate a redirect URI for a desktop OAuth client: HTTPS, or plain
+/// HTTP on a loopback host (RFC 8252 section 7.3). Credentials, query
+/// strings, and fragments are rejected.
+pub fn validate_oauth_redirect_uri(raw: &str) -> Result<reqwest::Url, String> {
+    validate_remote_url(raw).map_err(|_| {
+        "Redirect URI must be HTTPS, or http:// on localhost, without credentials, query, or fragment"
+            .to_string()
+    })
+}
+
+fn fetch_json(url: &str, what: &str) -> Result<Value, String> {
+    let client = http_client(Duration::from_secs(30))?;
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|_| format!("{what} request failed or timed out"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{what} returned HTTP {}.",
+            response.status().as_u16()
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_MCP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("Failed reading {what}"))?;
+    if bytes.len() as u64 > MAX_MCP_RESPONSE_BYTES {
+        return Err(format!("{what} exceeds the 4 MB limit"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| format!("{what} is not valid JSON"))
+}
+
+fn parse_protected_resource(body: &Value) -> Result<ProtectedResourceMetadata, String> {
+    serde_json::from_value(body.clone())
+        .map_err(|_| "Protected-resource metadata is not in the expected shape".to_string())
+}
+
+fn parse_authorization_server(body: &Value) -> Result<AuthorizationServerMetadata, String> {
+    serde_json::from_value(body.clone())
+        .map_err(|_| "Authorization-server metadata is not in the expected shape".to_string())
+}
+
+/// Discover the Higgsfield OAuth endpoints from the two public
+/// metadata documents. No account or credential is needed.
+pub fn discover_higgsfield_oauth() -> Result<OAuthDiscovery, String> {
+    let protected = fetch_json(
+        HIGGSFIELD_OAUTH_PROTECTED_RESOURCE_URL,
+        "OAuth protected-resource metadata",
+    )?;
+    let protected = parse_protected_resource(&protected)?;
+    if protected.resource != HIGGSFIELD_MCP_URL {
+        return Err(
+            "Protected-resource metadata names a different resource than the Higgsfield MCP endpoint"
+                .into(),
+        );
+    }
+    let server = fetch_json(
+        HIGGSFIELD_OAUTH_AUTHORIZATION_SERVER_URL,
+        "OAuth authorization-server metadata",
+    )?;
+    let server = parse_authorization_server(&server)?;
+    validate_oauth_endpoint(&server.authorization_endpoint)?;
+    validate_oauth_endpoint(&server.token_endpoint)?;
+    if let Some(registration) = &server.registration_endpoint {
+        validate_oauth_endpoint(registration)?;
+    }
+    Ok(OAuthDiscovery {
+        resource: protected.resource,
+        authorization_servers: protected.authorization_servers,
+        authorization_endpoint: server.authorization_endpoint,
+        token_endpoint: server.token_endpoint,
+        registration_endpoint: server.registration_endpoint,
+        // The authorization-server document is authoritative for
+        // scopes; the protected-resource document is the fallback
+        // when it lists none.
+        scopes_supported: if server.scopes_supported.is_empty() {
+            protected.scopes_supported
+        } else {
+            server.scopes_supported
+        },
+        code_challenge_methods_supported: server.code_challenge_methods_supported,
+        client_id_metadata_document_supported: server.client_id_metadata_document_supported,
+        grant_types_supported: server.grant_types_supported,
+        response_types_supported: server.response_types_supported,
+    })
+}
+
+/// S256 PKCE challenge for a verifier (RFC 7636 section 4.2):
+/// base64url without padding of SHA-256 of the verifier.
+pub fn pkce_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Generate a PKCE pair. The verifier is 64 lowercase hex characters
+/// from two UUID v4 values (256 bits of randomness from the operating
+/// system's generator, via the `uuid` crate), inside the 43–128
+/// character range RFC 7636 requires. The verifier is a secret for the
+/// pending flow: it is kept in panel memory only and never persisted.
+pub fn generate_pkce_pair() -> PkcePair {
+    let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let challenge = pkce_challenge(&verifier);
+    PkcePair {
+        verifier,
+        challenge,
+    }
+}
+
+fn validate_pkce_verifier(verifier: &str) -> Result<(), String> {
+    if verifier.len() < 43
+        || verifier.len() > 128
+        || !verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ['-', '.', '_', '~'].contains(&c))
+    {
+        return Err("PKCE verifier must be 43–128 unreserved characters".into());
+    }
+    Ok(())
+}
+
+fn validate_oauth_state(state: &str) -> Result<(), String> {
+    if state.is_empty()
+        || state.len() > 256
+        || state.chars().any(char::is_control)
+        || state.chars().any(char::is_whitespace)
+    {
+        return Err("OAuth state must be 1–256 characters without whitespace".into());
+    }
+    Ok(())
+}
+
+fn validate_client_id(client_id: &str) -> Result<(), String> {
+    if client_id.is_empty()
+        || client_id.len() > 256
+        || client_id
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("OAuth client id must be 1–256 characters without whitespace".into());
+    }
+    Ok(())
+}
+
+/// Build the Higgsfield authorization URL for the authorization-code
+/// flow with PKCE (S256). The `resource` parameter (RFC 8707) names
+/// the MCP endpoint the token is for. Opening this URL and signing in
+/// is the user's step; the code that comes back is exchanged with
+/// [`exchange_oauth_code`].
+pub fn build_oauth_authorization_url(
+    authorization_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code_challenge: &str,
+    state: &str,
+) -> Result<String, String> {
+    let mut url = validate_oauth_endpoint(authorization_endpoint)?;
+    validate_client_id(client_id)?;
+    validate_oauth_redirect_uri(redirect_uri)?;
+    validate_pkce_verifier(code_challenge)?;
+    validate_oauth_state(state)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", HIGGSFIELD_OAUTH_SCOPES)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("resource", HIGGSFIELD_MCP_URL);
+    Ok(url.to_string())
+}
+
+/// Register this app as an OAuth client with the authorization server
+/// (RFC 7591 dynamic client registration). The server decides whether
+/// to accept the registration; a refusal is reported, not hidden.
+/// Returns the issued client id and, when the server issues one, the
+/// client secret.
+pub fn register_oauth_client(redirect_uri: &str) -> Result<OAuthClientRegistration, String> {
+    validate_oauth_redirect_uri(redirect_uri)?;
+    let discovery = discover_higgsfield_oauth()?;
+    let registration_endpoint = discovery.registration_endpoint.ok_or(
+        "The authorization server publishes no registration endpoint; dynamic client registration is unavailable",
+    )?;
+    let client = http_client(Duration::from_secs(30))?;
+    let response = client
+        .post(registration_endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "client_name": OAUTH_CLIENT_NAME,
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "scope": HIGGSFIELD_OAUTH_SCOPES,
+        }))
+        .send()
+        .map_err(|_| "OAuth client registration request failed or timed out".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "OAuth client registration returned HTTP {}. The authorization server may not accept dynamically registered clients.",
+            response.status().as_u16()
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_MCP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Failed reading OAuth client registration response")?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "OAuth registration returned invalid JSON")?;
+    let client_id = value
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or("OAuth registration returned no client id")?;
+    validate_client_id(client_id)?;
+    Ok(OAuthClientRegistration {
+        client_id: client_id.to_owned(),
+        client_secret: value
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        client_id_issued_at: value.get("client_id_issued_at").and_then(Value::as_i64),
+        client_secret_expires_at: value
+            .get("client_secret_expires_at")
+            .and_then(Value::as_i64),
+    })
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` value:
+/// unreserved characters pass through, a space becomes `+`, and
+/// everything else becomes uppercase `%XX`. The `reqwest` build used
+/// here has no `form` feature, so token requests are encoded by hand.
+pub fn percent_encode_form_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn form_body(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                percent_encode_form_value(key),
+                percent_encode_form_value(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Build the authorization-code exchange request body (RFC 6749
+/// section 4.1.3). Pure, so it is unit-tested without any network.
+pub fn build_token_exchange_body(
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    client_secret: Option<&str>,
+) -> String {
+    let mut pairs = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", code_verifier),
+    ];
+    if let Some(secret) = client_secret.filter(|s| !s.is_empty()) {
+        pairs.push(("client_secret", secret));
+    }
+    form_body(&pairs)
+}
+
+/// Build the refresh-token request body (RFC 6749 section 6).
+pub fn build_refresh_token_body(
+    client_id: &str,
+    refresh_token: &str,
+    client_secret: Option<&str>,
+) -> String {
+    let mut pairs = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = client_secret.filter(|s| !s.is_empty()) {
+        pairs.push(("client_secret", secret));
+    }
+    form_body(&pairs)
+}
+
+fn parse_oauth_token_response(body: &str) -> Result<OAuthTokenResponse, String> {
+    if body.len() > MAX_MCP_RESPONSE_BYTES as usize {
+        return Err("OAuth token response exceeds the 4 MB limit".into());
+    }
+    let value: Value =
+        serde_json::from_str(body).map_err(|_| "OAuth token response is not valid JSON")?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        let description = value
+            .get("error_description")
+            .and_then(Value::as_str)
+            .unwrap_or("OAuth token request failed");
+        return Err(format!("OAuth token error {error}: {description}"));
+    }
+    let access_token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("OAuth token response carries no access token")?;
+    Ok(OAuthTokenResponse {
+        access_token: Zeroizing::new(access_token.to_owned()),
+        token_type: value
+            .get("token_type")
+            .and_then(Value::as_str)
+            .unwrap_or("Bearer")
+            .to_owned(),
+        expires_in: value.get("expires_in").and_then(Value::as_u64),
+        refresh_token: value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| Zeroizing::new(s.to_owned())),
+        scope: value
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn post_token_request(token_endpoint: &str, body: &str) -> Result<OAuthTokenResponse, String> {
+    validate_oauth_endpoint(token_endpoint)?;
+    let client = http_client(Duration::from_secs(30))?;
+    let response = client
+        .post(token_endpoint)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body.to_owned())
+        .send()
+        .map_err(|_| "OAuth token request failed or timed out".to_string())?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_MCP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Failed reading OAuth token response")?;
+    if bytes.len() as u64 > MAX_MCP_RESPONSE_BYTES {
+        return Err("OAuth token response exceeds the 4 MB limit".into());
+    }
+    if !status.is_success() {
+        // Parse the error body for its error code when possible, but
+        // never echo token material back.
+        let text = String::from_utf8_lossy(&bytes);
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Some(error) = value.get("error").and_then(Value::as_str) {
+                return Err(format!("OAuth token request failed ({error})"));
+            }
+        }
+        return Err(format!(
+            "OAuth token request returned HTTP {}. The code may have expired or already been used.",
+            status.as_u16()
+        ));
+    }
+    parse_oauth_token_response(&String::from_utf8_lossy(&bytes))
+}
+
+fn validate_oauth_code(code: &str) -> Result<(), String> {
+    if code.is_empty()
+        || code.len() > 2048
+        || code.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("Authorization code must be 1–2048 characters without whitespace".into());
+    }
+    Ok(())
+}
+
+/// Exchange an authorization code for tokens (RFC 6749 section 4.1.3).
+/// The access token is stored under `server_id` and the refresh token,
+/// when issued, under `{server_id}-refresh`, using the same credential
+/// storage as API keys. Only a summary is returned.
+pub fn exchange_oauth_code(
+    credentials: &McpCredentials,
+    token_endpoint: &str,
+    server_id: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    storage: &str,
+) -> Result<OAuthTokenSummary, String> {
+    validate_server_id(server_id)?;
+    validate_client_id(client_id)?;
+    validate_oauth_code(code)?;
+    validate_oauth_redirect_uri(redirect_uri)?;
+    validate_pkce_verifier(code_verifier)?;
+    let body =
+        build_token_exchange_body(client_id, code, redirect_uri, code_verifier, client_secret);
+    let tokens = post_token_request(token_endpoint, &body)?;
+    store_oauth_tokens(credentials, server_id, &tokens, storage)?;
+    Ok(OAuthTokenSummary {
+        token_type: tokens.token_type,
+        expires_in: tokens.expires_in,
+        has_refresh_token: tokens.refresh_token.is_some(),
+        scope: tokens.scope,
+    })
+}
+
+fn store_oauth_tokens(
+    credentials: &McpCredentials,
+    server_id: &str,
+    tokens: &OAuthTokenResponse,
+    storage: &str,
+) -> Result<(), String> {
+    credentials.set(server_id, tokens.access_token.to_string(), storage)?;
+    if let Some(refresh) = &tokens.refresh_token {
+        credentials.set(
+            &format!("{server_id}-refresh"),
+            refresh.to_string(),
+            storage,
+        )?;
+    }
+    Ok(())
+}
+
+/// Refresh an expired access token with the stored refresh token (RFC
+/// 6749 section 6). A newly issued refresh token replaces the stored
+/// one; when the server issues none, the stored token is kept.
+pub fn refresh_oauth_access_token(
+    credentials: &McpCredentials,
+    token_endpoint: &str,
+    server_id: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    storage: &str,
+) -> Result<OAuthTokenSummary, String> {
+    validate_server_id(server_id)?;
+    validate_client_id(client_id)?;
+    let refresh = credentials.get(&format!("{server_id}-refresh"))?;
+    let body = build_refresh_token_body(client_id, &refresh, client_secret);
+    let tokens = post_token_request(token_endpoint, &body)?;
+    store_oauth_tokens(credentials, server_id, &tokens, storage)?;
+    Ok(OAuthTokenSummary {
+        token_type: tokens.token_type,
+        expires_in: tokens.expires_in,
+        has_refresh_token: tokens.refresh_token.is_some(),
+        scope: tokens.scope,
+    })
+}
+
 // --- Download -------------------------------------------------------------
 
 /// Validate a download file name: a plain file name (no directories)
@@ -1373,9 +2314,10 @@ pub struct McpPreset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     pub auth: AuthKind,
-    /// `false` when the preset cannot be used yet (OAuth not
-    /// implemented). Listed so the panel can explain why, not as a
-    /// working option.
+    /// `false` when the preset is not ready for one-click use (the
+    /// Higgsfield hosted MCP flow is implemented but untested end to
+    /// end). Listed so the panel can explain why, not as a working
+    /// option.
     pub available: bool,
     /// Tool names verified for this server. Empty when the tool list is
     /// discovered at connect time with `tools/list`.
@@ -1414,8 +2356,9 @@ pub fn builtin_presets() -> Vec<McpPreset> {
             available: false,
             tools: vec![],
             notes: vec![
-                "OAuth sign-in is not implemented in this release, so this preset cannot connect yet.".into(),
-                "Use the Higgsfield REST API preset instead; it covers the same generation models.".into(),
+                "OAuth sign-in is implemented as a client-side authorization-code flow with PKCE (endpoint discovery, dynamic client registration, code exchange, token refresh), but it is untested end to end.".into(),
+                "Completing sign-in needs a Higgsfield account in a browser and the authorization code pasted back into the panel; the app has no redirect receiver yet.".into(),
+                "Use the Higgsfield REST API preset instead for a tested path; it covers the same generation models.".into(),
             ],
         },
         McpPreset {
@@ -1437,6 +2380,7 @@ pub fn builtin_presets() -> Vec<McpPreset> {
             notes: vec![
                 "Video duration 4–15 seconds; resolutions 480p and 720p.".into(),
                 "Video generation is asynchronous: generate_video returns a task id, then poll get_generation until the media URL is ready.".into(),
+                "Parameter fields are built from the server's live tools/list input schema; the first live generate_video call with those fields has not been tested in this environment.".into(),
                 "This is the independently operated hosted workspace at hyperframes.net, not HeyGen's open-source HyperFrames HTML-to-video CLI.".into(),
             ],
         },
@@ -1782,6 +2726,166 @@ pub async fn mcp_download_result(
     .map_err(|_| "Download task failed".to_string())?
 }
 
+/// Build the parameter form for one tool from its live `inputSchema`.
+/// Connects, lists tools, and converts the named tool's schema into
+/// form fields. An empty list means the server reported no schema, and
+/// the panel falls back to the free-form JSON editor.
+#[tauri::command]
+pub async fn mcp_tool_form_fields(
+    app: tauri::AppHandle,
+    server: ServerConfig,
+    tool: String,
+    api_key: Option<String>,
+) -> Result<Vec<FormField>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let credentials = app.state::<McpCredentials>();
+        let key = if server_needs_auth(&server) {
+            Some(resolve_key(&credentials, &server.id, api_key)?)
+        } else {
+            optional_key(api_key)?
+        };
+        validate_tool_name(&tool)?;
+        let mut client = McpClient::connect(&server, key)?;
+        let tools = client.list_tools()?;
+        let found = tools
+            .into_iter()
+            .find(|t| t.name == tool)
+            .ok_or_else(|| format!("Tool \"{tool}\" was not listed by the server"))?;
+        Ok(form_fields_from_schema(&found.input_schema))
+    })
+    .await
+    .map_err(|_| "MCP form fields task failed".to_string())?
+}
+
+/// Validate assembled tool arguments against a tool's `inputSchema`
+/// before the call is sent. For HyperFrames `generate_video` and
+/// `generate_image` the documented vendor limits are checked as well.
+/// Pure validation: no network, no credentials.
+#[tauri::command]
+pub fn mcp_validate_tool_arguments(
+    tool: String,
+    schema: Value,
+    arguments: Value,
+) -> Result<(), String> {
+    validate_tool_name(&tool)?;
+    validate_arguments_against_schema(&schema, &arguments)?;
+    validate_hyperframes_arguments(&tool, &arguments)
+}
+
+/// Discover the Higgsfield OAuth endpoints from the public metadata
+/// documents. No account or credential is needed.
+#[tauri::command]
+pub async fn mcp_oauth_discover_higgsfield() -> Result<OAuthDiscovery, String> {
+    tauri::async_runtime::spawn_blocking(discover_higgsfield_oauth)
+        .await
+        .map_err(|_| "OAuth discovery task failed".to_string())?
+}
+
+/// Register this app as an OAuth client with the Higgsfield
+/// authorization server (dynamic client registration). Untested end
+/// to end: the server may refuse the registration.
+#[tauri::command]
+pub async fn mcp_oauth_register_client(
+    redirect_uri: String,
+) -> Result<OAuthClientRegistration, String> {
+    tauri::async_runtime::spawn_blocking(move || register_oauth_client(&redirect_uri))
+        .await
+        .map_err(|_| "OAuth registration task failed".to_string())?
+}
+
+/// Generate a PKCE pair for one sign-in attempt. The verifier is kept
+/// in panel memory only and passed back to the code exchange; it is
+/// never persisted.
+#[tauri::command]
+pub fn mcp_oauth_pkce_pair() -> PkcePair {
+    generate_pkce_pair()
+}
+
+/// Build the Higgsfield authorization URL for the authorization-code
+/// flow with PKCE. The user opens this URL in a browser and signs in;
+/// the code that comes back is exchanged with
+/// `mcp_oauth_exchange_code`. The authorization endpoint comes from
+/// `mcp_oauth_discover_higgsfield`, not from a hard-coded value.
+#[tauri::command]
+pub fn mcp_oauth_authorization_url(
+    authorization_endpoint: String,
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    state: String,
+) -> Result<String, String> {
+    build_oauth_authorization_url(
+        &authorization_endpoint,
+        &client_id,
+        &redirect_uri,
+        &code_challenge,
+        &state,
+    )
+}
+
+/// Exchange an authorization code for tokens. The access token is
+/// stored under `server_id` and the refresh token, when issued, under
+/// `{server_id}-refresh`, in the chosen credential storage. Only a
+/// summary is returned; token values are never exposed.
+#[tauri::command]
+pub async fn mcp_oauth_exchange_code(
+    app: tauri::AppHandle,
+    token_endpoint: String,
+    server_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+    code: String,
+    redirect_uri: String,
+    code_verifier: String,
+    storage: String,
+) -> Result<OAuthTokenSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let credentials = app.state::<McpCredentials>();
+        exchange_oauth_code(
+            &credentials,
+            &token_endpoint,
+            &server_id,
+            &client_id,
+            client_secret.as_deref(),
+            &code,
+            &redirect_uri,
+            &code_verifier,
+            &storage,
+        )
+    })
+    .await
+    .map_err(|_| "OAuth code exchange task failed".to_string())?
+}
+
+/// Refresh an expired Higgsfield access token with the stored refresh
+/// token. Only a summary is returned; token values are never exposed.
+#[tauri::command]
+pub async fn mcp_oauth_refresh_token(
+    app: tauri::AppHandle,
+    token_endpoint: String,
+    server_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+    storage: String,
+) -> Result<OAuthTokenSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let credentials = app.state::<McpCredentials>();
+        refresh_oauth_access_token(
+            &credentials,
+            &token_endpoint,
+            &server_id,
+            &client_id,
+            client_secret.as_deref(),
+            &storage,
+        )
+    })
+    .await
+    .map_err(|_| "OAuth token refresh task failed".to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1985,5 +3089,393 @@ mod tests {
         assert!(validate_download_file_name("clip").is_err());
         assert!(validate_download_file_name("clip.txt").is_err());
         assert!(validate_download_file_name("a/b.mp4").is_err());
+    }
+
+    fn sample_generate_video_schema() -> Value {
+        // The shape of a tools/list inputSchema, with the parameter
+        // names documented on hyperframes.net/hyperframes-mcp
+        // (6 November 2026). The names come from that page; the test
+        // proves the conversion, not the live server response, which
+        // has not been fetched here.
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Text prompt for the video", "maxLength": 4000},
+                "image_url": {"type": "string", "description": "Source image URL"},
+                "video_urls": {"type": "array", "items": {"type": "string"}, "description": "Reference clips"},
+                "duration_seconds": {"type": "integer", "minimum": 4, "maximum": 15, "default": 15},
+                "resolution": {"type": "string", "enum": ["480p", "720p"], "default": "720p"},
+                "fast": {"type": "boolean", "default": true},
+                "seed": {"type": "integer"}
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    #[test]
+    fn input_schema_converts_to_form_fields() {
+        let fields = form_fields_from_schema(&sample_generate_video_schema());
+        assert_eq!(fields.len(), 7);
+        let prompt = fields.iter().find(|f| f.name == "prompt").unwrap();
+        assert_eq!(prompt.field_type, "string");
+        assert!(prompt.required);
+        assert_eq!(prompt.max_length, Some(4000));
+        assert_eq!(
+            prompt.description.as_deref(),
+            Some("Text prompt for the video")
+        );
+        let duration = fields
+            .iter()
+            .find(|f| f.name == "duration_seconds")
+            .unwrap();
+        assert_eq!(duration.field_type, "integer");
+        assert!(!duration.required);
+        assert_eq!(duration.minimum, Some(4.0));
+        assert_eq!(duration.maximum, Some(15.0));
+        assert_eq!(duration.default, Some(json!(15)));
+        let resolution = fields.iter().find(|f| f.name == "resolution").unwrap();
+        assert_eq!(resolution.enum_values, vec![json!("480p"), json!("720p")]);
+        assert_eq!(resolution.default, Some(json!("720p")));
+        let clips = fields.iter().find(|f| f.name == "video_urls").unwrap();
+        assert_eq!(clips.field_type, "array");
+        assert_eq!(clips.items_type.as_deref(), Some("string"));
+        let fast = fields.iter().find(|f| f.name == "fast").unwrap();
+        assert_eq!(fast.field_type, "boolean");
+        // A schema without properties yields no fields (JSON fallback).
+        assert!(form_fields_from_schema(&json!({"type": "object"})).is_empty());
+        assert!(form_fields_from_schema(&json!({})).is_empty());
+        assert!(form_fields_from_schema(&json!("not a schema")).is_empty());
+        // An enum without a type still infers the field type.
+        let inferred = form_fields_from_schema(&json!({
+            "type": "object",
+            "properties": {"mode": {"enum": ["fast", "standard"]}}
+        }));
+        assert_eq!(inferred[0].field_type, "string");
+    }
+
+    #[test]
+    fn schema_validation_covers_required_types_ranges_and_enums() {
+        let schema = sample_generate_video_schema();
+        let valid = json!({
+            "prompt": "A calm studio shot",
+            "duration_seconds": 4,
+            "resolution": "720p",
+            "fast": true,
+            "video_urls": ["https://example.com/ref.mp4"]
+        });
+        assert!(validate_arguments_against_schema(&schema, &valid).is_ok());
+        // Missing required prompt.
+        assert!(validate_arguments_against_schema(&schema, &json!({"fast": true})).is_err());
+        assert!(validate_arguments_against_schema(&schema, &json!({"prompt": null})).is_err());
+        // Wrong types.
+        assert!(validate_arguments_against_schema(
+            &schema,
+            &json!({"prompt": "x", "duration_seconds": "four"})
+        )
+        .is_err());
+        assert!(
+            validate_arguments_against_schema(&schema, &json!({"prompt": "x", "fast": "yes"}))
+                .is_err()
+        );
+        // Out of range and outside the enum.
+        assert!(validate_arguments_against_schema(
+            &schema,
+            &json!({"prompt": "x", "duration_seconds": 16})
+        )
+        .is_err());
+        assert!(validate_arguments_against_schema(
+            &schema,
+            &json!({"prompt": "x", "duration_seconds": 3})
+        )
+        .is_err());
+        assert!(validate_arguments_against_schema(
+            &schema,
+            &json!({"prompt": "x", "resolution": "1080p"})
+        )
+        .is_err());
+        // Prompt longer than the schema allows.
+        assert!(
+            validate_arguments_against_schema(&schema, &json!({"prompt": "x".repeat(4001)}))
+                .is_err()
+        );
+        // Array elements must match the declared item type.
+        assert!(validate_arguments_against_schema(
+            &schema,
+            &json!({"prompt": "x", "video_urls": ["https://example.com/a.mp4", 7]})
+        )
+        .is_err());
+        // Keys the schema does not describe are allowed.
+        assert!(validate_arguments_against_schema(
+            &schema,
+            &json!({"prompt": "x", "extra_note": "kept"})
+        )
+        .is_ok());
+        // Arguments must be an object; a schema without properties
+        // imposes nothing.
+        assert!(validate_arguments_against_schema(&schema, &json!("text")).is_err());
+        assert!(validate_arguments_against_schema(&json!({}), &json!({"anything": 1})).is_ok());
+    }
+
+    #[test]
+    fn hyperframes_documented_limits_are_enforced() {
+        assert!(validate_hyperframes_arguments(
+            "generate_video",
+            &json!({"prompt": "A short clip", "duration_seconds": 15, "resolution": "720p"})
+        )
+        .is_ok());
+        assert!(validate_hyperframes_arguments("generate_video", &json!({})).is_err());
+        assert!(
+            validate_hyperframes_arguments("generate_video", &json!({"prompt": "   "})).is_err()
+        );
+        assert!(validate_hyperframes_arguments(
+            "generate_video",
+            &json!({"prompt": "x".repeat(4001)})
+        )
+        .is_err());
+        assert!(validate_hyperframes_arguments(
+            "generate_video",
+            &json!({"prompt": "x", "duration_seconds": 0})
+        )
+        .is_err());
+        assert!(validate_hyperframes_arguments(
+            "generate_video",
+            &json!({"prompt": "x", "duration_seconds": 16})
+        )
+        .is_err());
+        assert!(validate_hyperframes_arguments(
+            "generate_video",
+            &json!({"prompt": "x", "duration_seconds": 4.5})
+        )
+        .is_err());
+        assert!(validate_hyperframes_arguments(
+            "generate_video",
+            &json!({"prompt": "x", "resolution": "1080p"})
+        )
+        .is_err());
+        assert!(validate_hyperframes_arguments(
+            "generate_image",
+            &json!({"prompt": "A still", "resolution": "2K"})
+        )
+        .is_ok());
+        assert!(validate_hyperframes_arguments(
+            "generate_image",
+            &json!({"prompt": "A still", "resolution": "720p"})
+        )
+        .is_err());
+        // Other tools are unaffected.
+        assert!(validate_hyperframes_arguments("list_models", &json!({})).is_ok());
+        assert!(validate_hyperframes_arguments("get_generation", &json!({"id": "t-1"})).is_ok());
+    }
+
+    #[test]
+    fn oauth_authorization_url_carries_code_flow_pkce_and_resource() {
+        let url = build_oauth_authorization_url(
+            "https://mcp.higgsfield.ai/oauth2/authorize",
+            "client-123",
+            "http://127.0.0.1:49152/callback",
+            &"a".repeat(43),
+            "state-xyz",
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("mcp.higgsfield.ai"));
+        let query: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
+        assert_eq!(query["response_type"], "code");
+        assert_eq!(query["client_id"], "client-123");
+        assert_eq!(query["redirect_uri"], "http://127.0.0.1:49152/callback");
+        assert_eq!(query["scope"], "openid email offline_access");
+        assert_eq!(query["code_challenge"], "a".repeat(43));
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert_eq!(query["state"], "state-xyz");
+        assert_eq!(query["resource"], "https://mcp.higgsfield.ai/mcp");
+        // Rejected inputs: non-HTTPS endpoint, non-loopback redirect,
+        // short challenge, blank state, blank client id.
+        assert!(build_oauth_authorization_url(
+            "http://mcp.higgsfield.ai/oauth2/authorize",
+            "client-123",
+            "http://127.0.0.1:49152/callback",
+            &"a".repeat(43),
+            "state-xyz",
+        )
+        .is_err());
+        assert!(build_oauth_authorization_url(
+            "https://mcp.higgsfield.ai/oauth2/authorize",
+            "client-123",
+            "http://example.com/callback",
+            &"a".repeat(43),
+            "state-xyz",
+        )
+        .is_err());
+        assert!(build_oauth_authorization_url(
+            "https://mcp.higgsfield.ai/oauth2/authorize",
+            "client-123",
+            "http://127.0.0.1:49152/callback",
+            "too-short",
+            "state-xyz",
+        )
+        .is_err());
+        assert!(build_oauth_authorization_url(
+            "https://mcp.higgsfield.ai/oauth2/authorize",
+            "client-123",
+            "http://127.0.0.1:49152/callback",
+            &"a".repeat(43),
+            "",
+        )
+        .is_err());
+        assert!(build_oauth_authorization_url(
+            "https://mcp.higgsfield.ai/oauth2/authorize",
+            "",
+            "http://127.0.0.1:49152/callback",
+            &"a".repeat(43),
+            "state-xyz",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn oauth_redirect_uris_allow_loopback_and_https_only() {
+        assert!(validate_oauth_redirect_uri("http://127.0.0.1:49152/callback").is_ok());
+        assert!(validate_oauth_redirect_uri("http://localhost:8080/callback").is_ok());
+        assert!(validate_oauth_redirect_uri("https://example.com/oauth/callback").is_ok());
+        assert!(validate_oauth_redirect_uri("http://example.com/callback").is_err());
+        assert!(validate_oauth_redirect_uri("myapp:/callback").is_err());
+        assert!(validate_oauth_redirect_uri("http://127.0.0.1:49152/callback?x=1").is_err());
+        assert!(validate_oauth_redirect_uri("http://127.0.0.1:49152/callback#frag").is_err());
+    }
+
+    #[test]
+    fn pkce_pair_is_well_formed_and_challenge_matches_rfc7636() {
+        // RFC 7636 appendix B test vector.
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        let pair = generate_pkce_pair();
+        assert_eq!(pair.verifier.len(), 64);
+        assert!(pair.verifier.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(pair.challenge, pkce_challenge(&pair.verifier));
+        assert_eq!(pair.challenge.len(), 43);
+        assert!(!pair.challenge.contains(['=', '+', '/']));
+        assert_ne!(generate_pkce_pair().verifier, pair.verifier);
+    }
+
+    #[test]
+    fn form_encoding_and_token_bodies_are_exact() {
+        assert_eq!(percent_encode_form_value("abc-._~XYZ09"), "abc-._~XYZ09");
+        assert_eq!(percent_encode_form_value("a b&c=d"), "a+b%26c%3D");
+        assert_eq!(
+            percent_encode_form_value("http://127.0.0.1:49152/callback"),
+            "http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"
+        );
+        let body = build_token_exchange_body(
+            "client-1",
+            "SplxlOBeZQQ",
+            "http://127.0.0.1:49152/callback",
+            &"v".repeat(43),
+            None,
+        );
+        assert!(body.starts_with("grant_type=authorization_code&code=SplxlOBeZQQ&"));
+        assert!(body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"));
+        assert!(body.contains("client_id=client-1"));
+        assert!(!body.contains("client_secret"));
+        let with_secret = build_token_exchange_body(
+            "client-1",
+            "code-1",
+            "http://127.0.0.1:49152/callback",
+            &"v".repeat(43),
+            Some("s3cret"),
+        );
+        assert!(with_secret.contains("client_secret=s3cret"));
+        let refresh = build_refresh_token_body("client-1", "refresh-token-1", None);
+        assert_eq!(
+            refresh,
+            "grant_type=refresh_token&refresh_token=refresh-token-1&client_id=client-1"
+        );
+    }
+
+    #[test]
+    fn oauth_token_response_parsing_keeps_values_out_of_errors() {
+        let parsed = parse_oauth_token_response(
+            r#"{"access_token":"tok-1","token_type":"Bearer","expires_in":3600,"refresh_token":"ref-1","scope":"openid email offline_access"}"#,
+        )
+        .unwrap();
+        assert_eq!(&*parsed.access_token, "tok-1");
+        assert_eq!(parsed.token_type, "Bearer");
+        assert_eq!(parsed.expires_in, Some(3600));
+        assert_eq!(parsed.refresh_token.as_deref(), Some("ref-1"));
+        assert_eq!(parsed.scope.as_deref(), Some("openid email offline_access"));
+        // A response without an access token is an error, and the
+        // error never echoes the body.
+        let error = parse_oauth_token_response(r#"{"token_type":"Bearer"}"#).unwrap_err();
+        assert!(!error.contains("Bearer"));
+        let oauth_error = parse_oauth_token_response(
+            r#"{"error":"invalid_grant","error_description":"The code expired"}"#,
+        )
+        .unwrap_err();
+        assert!(oauth_error.contains("invalid_grant"));
+        assert!(oauth_error.contains("The code expired"));
+    }
+
+    #[test]
+    fn live_oauth_metadata_documents_parse_to_the_discovered_endpoints() {
+        // Fixtures are the exact public metadata documents fetched from
+        // the live server on 27 November 2026 (no account, no
+        // credentials). They pin the discovery parsing to what the
+        // server actually returns today.
+        let protected = parse_protected_resource(&json!({
+            "resource": "https://mcp.higgsfield.ai/mcp",
+            "authorization_servers": ["https://higgsfield.ai/_clerk"],
+            "scopes_supported": ["openid", "email", "offline_access"],
+            "bearer_methods_supported": ["header"],
+            "higgsfield_auth_hints": {"selection": "client_capability_based"}
+        }))
+        .unwrap();
+        assert_eq!(protected.resource, HIGGSFIELD_MCP_URL);
+        assert_eq!(
+            protected.authorization_servers,
+            vec!["https://higgsfield.ai/_clerk"]
+        );
+        assert_eq!(
+            protected.scopes_supported,
+            vec!["openid", "email", "offline_access"]
+        );
+        let server = parse_authorization_server(&json!({
+            "issuer": "https://mcp.higgsfield.ai",
+            "authorization_endpoint": "https://mcp.higgsfield.ai/oauth2/authorize",
+            "token_endpoint": "https://mcp.higgsfield.ai/oauth2/token",
+            "registration_endpoint": "https://mcp.higgsfield.ai/oauth2/register",
+            "client_id_metadata_document_supported": true,
+            "response_types_supported": ["code"],
+            "response_modes_supported": ["form_post", "query"],
+            "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "none", "client_secret_post"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["openid", "email", "offline_access"],
+            "claims_supported": ["aud", "email", "email_verified", "exp", "family_name", "given_name", "iat", "iss", "name", "picture", "preferred_username", "sub", "org_id"]
+        }))
+        .unwrap();
+        assert_eq!(
+            server.authorization_endpoint,
+            "https://mcp.higgsfield.ai/oauth2/authorize"
+        );
+        assert_eq!(
+            server.token_endpoint,
+            "https://mcp.higgsfield.ai/oauth2/token"
+        );
+        assert_eq!(
+            server.registration_endpoint.as_deref(),
+            Some("https://mcp.higgsfield.ai/oauth2/register")
+        );
+        assert!(server.client_id_metadata_document_supported);
+        assert_eq!(server.code_challenge_methods_supported, vec!["S256"]);
+        assert_eq!(
+            server.scopes_supported,
+            vec!["openid", "email", "offline_access"]
+        );
+        assert!(server
+            .grant_types_supported
+            .contains(&"refresh_token".to_string()));
     }
 }
