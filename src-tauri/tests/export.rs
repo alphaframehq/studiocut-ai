@@ -483,6 +483,7 @@ fn vertical_settings(fill: &str) -> ExportSettings {
         encoder: "libx264".into(),
         aspect: "vertical".into(),
         fill: fill.into(),
+        ..Default::default()
     }
 }
 
