@@ -6,11 +6,14 @@ app uses — `ffmpeg`, `ffprobe`, `whisper-cli` (whisper.cpp) and its GGML model
 on Windows, macOS and Linux.
 
 The app must be able to find each binary on `PATH`, or you can point at exact
-locations:
+locations. The installed app ships its own `ffmpeg` and `ffprobe` sidecars
+next to the executable; those bundled binaries are used first. If no sidecar
+is present, the resolution order is:
 
-- **ffmpeg / ffprobe** — the Rust backend spawns them by name. If they are not on
-  `PATH`, export `FFMPEG_PATH` / `FFPROBE_PATH` with the absolute binary path
-  before launching StudioCut.
+- **ffmpeg / ffprobe** — the Rust backend resolves them in this order:
+  bundled sidecar next to the app executable, then `FFMPEG_PATH` /
+  `FFPROBE_PATH` with the absolute binary path, then the bare `ffmpeg` /
+  `ffprobe` on `PATH`.
 - **whisper-cli** — configured in **Settings › Transcription** as a path or
   command; the **Check availability** button verifies it immediately.
 - **GGML models** — a path to a single `.bin` model file, also set in
@@ -21,6 +24,26 @@ locations:
 Both binaries must come from the same FFmpeg build and must be version 6 or
 newer (the filtergraph compiler uses `adelay`, `sidechaincompress`, `lut3d`,
 `-progress pipe:1` and libass caption burn-in).
+
+### Binaries bundled with official releases
+
+Official StudioCut releases bundle prebuilt static FFmpeg binaries as Tauri
+sidecars, so no separate FFmpeg installation is required. Windows and Linux
+use the GPL builds from FFmpeg-Builds (BtbN,
+<https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases>); macOS uses the
+static builds from osxexperts.net (<https://osxexperts.net/>), with a
+separate archive for Apple Silicon and for Intel. The GPL builds are
+required because StudioCut exports with libx264, which is GPL-licensed and
+therefore absent from the LGPL builds; the LGPL builds were tried first and
+failed every export test on Windows with "Unknown encoder 'libx264'". The
+StudioCut application itself remains MIT-licensed. The bundled FFmpeg
+binary is a separate program covered by the GNU General Public License:
+releases must ship the GPL license text for the FFmpeg binary and an offer
+for its corresponding source, obtainable from the upstream FFmpeg-Builds
+release pages. The sidecars are downloaded at build time by
+`.github/workflows/release.yml` and are not stored in this repository. If
+no bundled sidecar is present, StudioCut falls back to `FFMPEG_PATH` /
+`FFPROBE_PATH`, or to an `ffmpeg` / `ffprobe` binary found on `PATH`.
 
 ### Windows (x86_64)
 

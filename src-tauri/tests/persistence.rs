@@ -11,6 +11,11 @@ fn create_atomic_save_replace_and_reopen() {
     assert_eq!(load_project(&path).unwrap(), project);
     let original = fs::File::open(&path).unwrap();
     project.name = "Second edit".into();
+    // On Windows the open handle on the destination blocks the replace
+    // (Rust opens files without FILE_SHARE_DELETE), so release it first.
+    // Unix keeps the handle open to verify the old inode is untouched.
+    #[cfg(not(unix))]
+    drop(original);
     save_project(&project, &path).unwrap();
     assert_eq!(load_project(&path).unwrap(), project);
     #[cfg(unix)]
@@ -21,8 +26,6 @@ fn create_atomic_save_replace_and_reopen() {
             "Replacement must not rewrite the original inode"
         );
     }
-    #[cfg(not(unix))]
-    drop(original);
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 

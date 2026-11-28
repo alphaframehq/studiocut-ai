@@ -159,7 +159,10 @@ fn write_record(root: &Path, asset_id: Uuid, record: &ProxyRecord) -> Result<(),
     use std::io::Write;
     temporary.write_all(&bytes).map_err(|e| e.to_string())?;
     temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    // Close the temporary file before the move: on Windows an open handle
+    // blocks the replace, while Unix renames open files without complaint.
     temporary
+        .into_temp_path()
         .persist(proxy_sidecar_path(root, asset_id))
         .map_err(|e| e.to_string())?;
     Ok(())

@@ -1,8 +1,17 @@
 # StudioCut AI — CI
-# Runs on every push and pull request: frontend build, Rust fmt, Rust tests.
-# The Rust tests run real FFmpeg exports, so the runner needs FFmpeg and
-# the Tauri Linux system libraries (the same set SETUP_BINARIES.md lists
-# for local development).
+# Runs on every push and pull request:
+# - frontend: the frontend build (Linux).
+# - rust: Rust fmt + Rust tests (Linux, real FFmpeg exports).
+# - windows: frontend build, Rust fmt + tests, a full Tauri build for
+#   Windows, and a headless smoke test of the built desktop app
+#   (launch, main window appears, stays alive). This is the Windows
+#   desktop verification step: it proves the app builds and starts on
+#   Windows, but it cannot prove the UI renders correctly — that still
+#   needs a human on a real desktop. The smoke test also captures real
+#   screenshots of the running app and uploads them as a CI artifact
+#   (windows-app-screenshots); README/docs screenshots must be copied
+#   from those artifacts — they do not exist yet, so do not invent or
+#   link any image files until a run has produced them.
 name: CI
 
 on:
@@ -43,3 +52,93 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast
         timeout-minutes: 30
+
+  windows:
+    name: Windows build + desktop smoke test
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Download FFmpeg sidecars (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip' -OutFile "$env:TEMP/ffmpeg-win64-gpl.zip"
+          Expand-Archive -Path "$env:TEMP/ffmpeg-win64-gpl.zip" -DestinationPath "$env:TEMP/ffmpeg-win64" -Force
+          Copy-Item "$env:TEMP/ffmpeg-win64/*/bin/ffmpeg.exe" 'src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe'
+          Copy-Item "$env:TEMP/ffmpeg-win64/*/bin/ffprobe.exe" 'src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe'
+          Get-ChildItem src-tauri/binaries
+      - run: npm ci
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Rust tests
+        env:
+          FFMPEG_PATH: ${{ github.workspace }}/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+          FFPROBE_PATH: ${{ github.workspace }}/src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast
+        timeout-minutes: 30
+      - name: Build Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npx tauri build
+      - name: Smoke test the built desktop app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing
+          Add-Type -AssemblyName System.Windows.Forms
+          function Save-Screenshot {
+            param([string]$Path)
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $gfx.Dispose()
+            $bmp.Dispose()
+            Write-Host "Screenshot saved: $Path ($($bounds.Width)x$($bounds.Height))"
+          }
+          $exe = 'src-tauri/target/release/studiocut-ai.exe'
+          if (-not (Test-Path $exe)) { throw "Built executable not found: $exe" }
+          foreach ($tool in 'ffmpeg-x86_64-pc-windows-msvc.exe','ffprobe-x86_64-pc-windows-msvc.exe') {
+            if (-not (Test-Path "src-tauri/target/release/$tool")) { throw "Bundled sidecar missing next to the exe: $tool" }
+          }
+          $proc = Start-Process -FilePath (Resolve-Path $exe).Path -PassThru
+          try {
+            $window = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $proc.Refresh()
+              if ($proc.HasExited) { throw "StudioCut AI exited during startup (exit code $($proc.ExitCode))" }
+              if ($proc.MainWindowHandle -ne 0) { $window = $true; break }
+            }
+            if (-not $window) { throw 'StudioCut AI stayed alive but no main window appeared within 30s' }
+            Write-Host "Main window appeared (PID $($proc.Id), handle $($proc.MainWindowHandle))"
+            New-Item -ItemType Directory -Force -Path screenshots | Out-Null
+            Start-Sleep -Seconds 2
+            Save-Screenshot 'screenshots/screenshot-01-main-window.png'
+            Start-Sleep -Seconds 10
+            Save-Screenshot 'screenshots/screenshot-02-after-10s.png'
+            Start-Sleep -Seconds 8
+            $proc.Refresh()
+            if ($proc.HasExited) { throw "StudioCut AI exited after its window appeared (exit code $($proc.ExitCode))" }
+            Write-Host 'Smoke test passed: app stayed alive 20s after its window appeared'
+          } finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+      - name: Upload app screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-app-screenshots
+          path: screenshots/
+          if-no-files-found: warn
+          retention-days: 30

@@ -7,7 +7,7 @@ import './design-tokens.css';
 import './styles.css';
 import './analysis.css';
 import { MediaLibrary } from './MediaLibrary';
-import { Timeline } from './Timeline';
+import { Timeline } from './TimelinePanel';
 import { Preview } from './Preview';
 import { AnalysisPanel } from './AnalysisPanel';
 import { DirectorPanel } from './DirectorPanel';

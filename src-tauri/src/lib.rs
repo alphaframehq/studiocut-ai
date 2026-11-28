@@ -185,7 +185,13 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), String> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     temporary.write_all(&bytes).map_err(|e| e.to_string())?;
     temporary.as_file().sync_all().map_err(|e| e.to_string())?;
-    temporary.persist(path).map_err(|e| e.to_string())?;
+    // Close the temporary file before the move: on Windows an open handle
+    // blocks the replace (`MoveFileEx` fails with "Access is denied"), while
+    // Unix renames open files without complaint.
+    temporary
+        .into_temp_path()
+        .persist(path)
+        .map_err(|e| e.to_string())?;
     #[cfg(unix)]
     File::open(parent)
         .and_then(|directory| directory.sync_all())

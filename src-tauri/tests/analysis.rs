@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 fn fixture(root: &std::path::Path) -> Project {
     let input = root.join("speech-and-silence.wav");
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(media::ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -58,7 +58,7 @@ fn real_scene_detection_finds_hard_cut_and_scores_shots() {
     let root = tempfile::tempdir().unwrap();
     let input = root.path().join("red-blue.mp4");
     // 2 s solid red, hard cut to 2 s solid blue.
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(media::ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -137,7 +137,7 @@ fn real_dsp_wav_captions_ripple_and_atomic_undo() {
     let wav = transcription::extract_wav(&project.assets[0], 0.5, 2.0).unwrap();
     let wav_path = root.path().join("extracted.wav");
     fs::write(&wav_path, wav).unwrap();
-    let probe = Command::new("ffprobe")
+    let probe = Command::new(media::ffprobe_path())
         .args(["-v", "error", "-show_streams", "-of", "json"])
         .arg(wav_path)
         .output()

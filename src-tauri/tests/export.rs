@@ -10,7 +10,7 @@ use studiocut_ai::{
     edl::{Effects, Lut},
     filtergraph::{compile, ExportSettings},
     finishing::{preset, validate_cube, Finishing, TransformKey},
-    media::import_media,
+    media::{ffmpeg_path, ffprobe_path, import_media},
     render::{parse_progress, ExportManager, Snapshot},
     timeline::{Clip, Track},
 };
@@ -26,7 +26,7 @@ fn settings() -> ExportSettings {
 }
 fn fixture(root: &Path) -> studiocut_ai::Project {
     let source = root.join("source ' [clip].mp4");
-    assert!(Command::new("ffmpeg")
+    assert!(Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -192,6 +192,16 @@ fn real_export_progress_reconnect_cancellation_and_atomic_publication() {
     ] {
         assert!(a.graph.contains(filter), "{filter}");
     }
+    // geq must precede the animated scale: geq requires constant-size
+    // frames, while scale with eval=frame changes the size on every
+    // frame, which FFmpeg 9 rejects at geq. (The audio volume filter
+    // also uses eval=frame, so the needle must be the scale itself.)
+    let geq = a.graph.find("geq=").expect("geq in graph");
+    let animated = a
+        .graph
+        .find("scale=w='max(2,trunc(")
+        .expect("animated scale in graph");
+    assert!(geq < animated, "geq must come before the animated scale");
     let manager = ExportManager::default();
     let output = root.path().join("finished.mp4");
     let initial = manager
@@ -487,7 +497,7 @@ fn vertical_settings(fill: &str) -> ExportSettings {
 }
 
 fn probe_dimensions(path: &Path) -> (u32, u32) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(ffprobe_path())
         .args([
             "-v",
             "error",
