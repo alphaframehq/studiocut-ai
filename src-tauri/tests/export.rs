@@ -192,6 +192,16 @@ fn real_export_progress_reconnect_cancellation_and_atomic_publication() {
     ] {
         assert!(a.graph.contains(filter), "{filter}");
     }
+    // geq must precede the animated scale: geq requires constant-size
+    // frames, while scale with eval=frame changes the size on every
+    // frame, which FFmpeg 9 rejects at geq. (The audio volume filter
+    // also uses eval=frame, so the needle must be the scale itself.)
+    let geq = a.graph.find("geq=").expect("geq in graph");
+    let animated = a
+        .graph
+        .find("scale=w='max(2,trunc(")
+        .expect("animated scale in graph");
+    assert!(geq < animated, "geq must come before the animated scale");
     let manager = ExportManager::default();
     let output = root.path().join("finished.mp4");
     let initial = manager
