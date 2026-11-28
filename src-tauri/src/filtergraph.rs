@@ -353,7 +353,18 @@ pub fn compile(project: &Project, settings: &ExportSettings) -> Result<Compiled,
                 if !f.transforms.is_empty() {
                     let scale = keys(|k| k.scale, &time, 1.0);
                     let opacity = keys(|k| k.opacity, &time.replace('t', "T"), 1.0);
-                    chain.push_str(&format!(",scale=w='max(2,trunc({w}*({scale})/2)*2)':h='max(2,trunc({h}*({scale})/2)*2)':eval=frame,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='255*({opacity})'"));
+                    // geq runs BEFORE the animated scale: geq requires
+                    // constant-size input frames (it declares no dynamic
+                    // frame-size support), while scale with eval=frame
+                    // changes the frame size on every frame. FFmpeg 9
+                    // rejects that size change at geq ("Frame size or
+                    // format changed without filter graph
+                    // reinitialization"). The overlay downstream accepts
+                    // varying sizes, so the scale stays last. The visual
+                    // result is unchanged: geq only copies the colour
+                    // planes and sets a uniform alpha, which scale then
+                    // scales along with the frame.
+                    chain.push_str(&format!(",format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='255*({opacity})',scale=w='max(2,trunc({w}*({scale})/2)*2)':h='max(2,trunc({h}*({scale})/2)*2)':eval=frame"));
                 }
                 chain.push_str(&format!(",setpts=PTS+{}/TB[v{input}]", number(start)));
                 nodes.push(chain);

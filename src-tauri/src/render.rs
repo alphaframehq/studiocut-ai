@@ -400,7 +400,12 @@ impl ExportManager {
         }
         self.update(id, |s| s.state = "validating".into());
         validate_output(&temporary, settings, compiled.duration, cancel)?;
-        fs::File::open(&temporary)
+        // sync_all is FlushFileBuffers on Windows, which needs a handle
+        // opened with write access; a read-only handle fails there with
+        // "Access is denied" (os error 5).
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
         let mut guard = self.job.lock().map_err(|e| e.to_string())?;
