@@ -260,7 +260,7 @@ pub fn ensure_licensed(path: &Path) -> Result<LicenseStatus, String> {
                 licensed: true,
                 license: Some(license),
             }),
-            Err(_) => Err(format!(
+            None => Err(format!(
                 "License required. Activate a license for machine fingerprint {fp} in Settings."
             )),
         }
