@@ -53,6 +53,51 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+/// Parse the major version from `ffmpeg -version` output, e.g.
+/// `ffmpeg version 9.1 ...` -> `Some(9)`. Git master builds report
+/// `ffmpeg version N-...`, which carries no release number -> `None`.
+fn parse_ffmpeg_major_version(banner: &str) -> Option<u32> {
+    let version = banner.split("version ").nth(1)?;
+    let digits: String = version.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether the FFmpeg binary understands the generic read-from-file
+/// option syntax `-/filter_complex <file>`.
+/// FFmpeg 9.0 removed `-filter_complex_script` (and `-filter_script`);
+/// the `-/` syntax that replaces it was added in FFmpeg 7.1. The
+/// bundled sidecars are FFmpeg 9+, but a system FFmpeg can be older,
+/// so the flag is picked from the detected major version. A git master
+/// build (`N-...`) is newer than any release, and an unparseable banner
+/// or a failed probe is treated as current: every bundled build is
+/// FFmpeg 9+.
+fn ffmpeg_supports_slash_file_option() -> bool {
+    let mut command = Command::new(ffmpeg_path());
+    command.args(["-hide_banner", "-version"]);
+    let cancel = AtomicBool::new(false);
+    match bounded_command(command, &cancel, Duration::from_secs(10), 65536) {
+        Ok(bytes) => match parse_ffmpeg_major_version(&String::from_utf8_lossy(&bytes)) {
+            Some(major) => major >= 7,
+            None => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// The two arguments that hand the compiled filtergraph file to FFmpeg,
+/// chosen for the FFmpeg version in use. The file contents are identical
+/// either way; only the flag differs.
+fn filter_complex_file_args() -> [&'static str; 2] {
+    if ffmpeg_supports_slash_file_option() {
+        ["-/filter_complex", "graph.txt"]
+    } else {
+        ["-filter_complex_script", "graph.txt"]
+    }
+}
 impl ExportManager {
     pub fn start(
         &self,
@@ -252,6 +297,7 @@ impl ExportManager {
             };
         });
         let temporary = root.join(format!("output.{}", settings.container));
+        let filter_complex = filter_complex_file_args();
         let mut command = Command::new(ffmpeg_path());
         command
             .current_dir(root)
@@ -265,18 +311,9 @@ impl ExportManager {
                 "1",
             ])
             .args(&compiled.inputs)
+            .args(filter_complex)
             .args([
-                "-filter_complex_script",
-                "graph.txt",
-                "-map",
-                "[vout]",
-                "-map",
-                "[aout]",
-                "-c:v",
-                &encoder,
-                "-threads",
-                "2",
-                "-pix_fmt",
+                "-map", "[vout]", "-map", "[aout]", "-c:v", &encoder, "-threads", "2", "-pix_fmt",
                 "yuv420p",
             ]);
         if encoder == "libx264" {
@@ -524,6 +561,47 @@ pub fn validate_output(
 #[cfg(test)]
 mod qualification_tests {
     use super::*;
+
+    #[test]
+    fn ffmpeg_major_version_parses_release_and_master_banners() {
+        assert_eq!(
+            parse_ffmpeg_major_version("ffmpeg version 9.1 Copyright (c) 2000-2026"),
+            Some(9)
+        );
+        assert_eq!(
+            parse_ffmpeg_major_version("ffmpeg version 8.1.2 Copyright (c) 2000-2026"),
+            Some(8)
+        );
+        assert_eq!(
+            parse_ffmpeg_major_version("ffmpeg version 6.1.1 Copyright (c) 2000-2023"),
+            Some(6)
+        );
+        assert_eq!(
+            parse_ffmpeg_major_version("ffmpeg version 4.4.2-0ubuntu0.22.04.1"),
+            Some(4)
+        );
+        // Git master builds carry no release number; they are newer than
+        // any release, so the caller treats them as current.
+        assert_eq!(
+            parse_ffmpeg_major_version("ffmpeg version N-120123-gabcdef Copyright (c)"),
+            None
+        );
+        assert_eq!(parse_ffmpeg_major_version("not ffmpeg at all"), None);
+        assert_eq!(parse_ffmpeg_major_version(""), None);
+    }
+
+    #[test]
+    fn slash_file_probe_agrees_with_the_local_ffmpeg_version() {
+        let mut command = Command::new(ffmpeg_path());
+        command.args(["-hide_banner", "-version"]);
+        let cancel = AtomicBool::new(false);
+        let bytes = bounded_command(command, &cancel, Duration::from_secs(10), 65536).unwrap();
+        let major = parse_ffmpeg_major_version(&String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            ffmpeg_supports_slash_file_option(),
+            major.map_or(true, |m| m >= 7)
+        );
+    }
 
     #[test]
     fn rejects_truncated_audio_despite_full_container_duration() {
