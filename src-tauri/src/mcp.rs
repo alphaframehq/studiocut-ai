@@ -1333,7 +1333,12 @@ pub fn download_result(
         return Err("Result download returned no data".into());
     }
     staging.as_file().sync_all().map_err(|e| e.to_string())?;
-    staging.persist(&target).map_err(|e| e.to_string())?;
+    // Close the temporary file before the move: on Windows an open handle
+    // blocks the replace, while Unix renames open files without complaint.
+    staging
+        .into_temp_path()
+        .persist(&target)
+        .map_err(|e| e.to_string())?;
     Ok(target)
 }
 
