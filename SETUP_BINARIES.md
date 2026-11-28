@@ -29,15 +29,21 @@ newer (the filtergraph compiler uses `adelay`, `sidechaincompress`, `lut3d`,
 
 Official StudioCut releases bundle prebuilt static FFmpeg binaries as Tauri
 sidecars, so no separate FFmpeg installation is required. Windows and Linux
-use the LGPL builds from FFmpeg-Builds (BtbN,
+use the GPL builds from FFmpeg-Builds (BtbN,
 <https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases>); macOS uses the
 static builds from osxexperts.net (<https://osxexperts.net/>), with a
-separate archive for Apple Silicon and for Intel. The corresponding FFmpeg
-sources can be obtained from those upstream release pages. The sidecars are
-downloaded at build time by `.github/workflows/release.yml` and are not
-stored in this repository. If no bundled sidecar is present, StudioCut falls
-back to `FFMPEG_PATH` / `FFPROBE_PATH`, or to an `ffmpeg` / `ffprobe` binary
-found on `PATH`.
+separate archive for Apple Silicon and for Intel. The GPL builds are
+required because StudioCut exports with libx264, which is GPL-licensed and
+therefore absent from the LGPL builds; the LGPL builds were tried first and
+failed every export test on Windows with "Unknown encoder 'libx264'". The
+StudioCut application itself remains MIT-licensed. The bundled FFmpeg
+binary is a separate program covered by the GNU General Public License:
+releases must ship the GPL license text for the FFmpeg binary and an offer
+for its corresponding source, obtainable from the upstream FFmpeg-Builds
+release pages. The sidecars are downloaded at build time by
+`.github/workflows/release.yml` and are not stored in this repository. If
+no bundled sidecar is present, StudioCut falls back to `FFMPEG_PATH` /
+`FFPROBE_PATH`, or to an `ffmpeg` / `ffprobe` binary found on `PATH`.
 
 ### Windows (x86_64)
 
