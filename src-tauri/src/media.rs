@@ -582,7 +582,11 @@ pub fn import_media(root: &Path, source: &Path) -> Result<Asset, String> {
                 )
                 .map_err(|e| e.to_string())?;
                 target.as_file().sync_all().map_err(|e| e.to_string())?;
+                // Close the temporary file before the move: on Windows an
+                // open handle blocks the replace, while Unix renames open
+                // files without complaint.
                 target
+                    .into_temp_path()
                     .persist(cache.join(name))
                     .map_err(|e| e.to_string())?;
             }
@@ -672,10 +676,14 @@ mod tests {
 
     #[test]
     fn sidecar_present_wins_over_env_override() {
-        let dir = sidecar_dir("ffmpeg");
+        // The sidecar file must carry the platform's name: a bare `ffmpeg`
+        // file is not the Windows sidecar (`ffmpeg.exe`), so creating it
+        // unconditionally made this test fail on Windows.
+        let name = sidecar_file_name("ffmpeg", cfg!(windows));
+        let dir = sidecar_dir(&name);
         assert_eq!(
             resolve_tool_path("ffmpeg", Some("/custom/ffmpeg"), Some(dir.path())),
-            dir.path().join("ffmpeg").to_string_lossy().into_owned()
+            dir.path().join(name).to_string_lossy().into_owned()
         );
     }
 
