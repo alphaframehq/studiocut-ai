@@ -71,8 +71,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
-          Invoke-WebRequest -Uri 'https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip' -OutFile "$env:TEMP/ffmpeg-win64-lgpl.zip"
-          Expand-Archive -Path "$env:TEMP/ffmpeg-win64-lgpl.zip" -DestinationPath "$env:TEMP/ffmpeg-win64" -Force
+          Invoke-WebRequest -Uri 'https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip' -OutFile "$env:TEMP/ffmpeg-win64-gpl.zip"
+          Expand-Archive -Path "$env:TEMP/ffmpeg-win64-gpl.zip" -DestinationPath "$env:TEMP/ffmpeg-win64" -Force
           Copy-Item "$env:TEMP/ffmpeg-win64/*/bin/ffmpeg.exe" 'src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe'
           Copy-Item "$env:TEMP/ffmpeg-win64/*/bin/ffprobe.exe" 'src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe'
           Get-ChildItem src-tauri/binaries
