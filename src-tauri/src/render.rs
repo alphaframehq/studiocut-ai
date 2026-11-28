@@ -205,7 +205,30 @@ impl ExportManager {
     fn update(&self, id: Uuid, change: impl FnOnce(&mut Snapshot)) {
         if let Ok(mut guard) = self.job.lock() {
             if let Some(job) = guard.as_mut().filter(|j| j.snapshot.id == id) {
+                let before = job.snapshot.clone();
                 change(&mut job.snapshot);
+                // Publish only when the visible content changed. The
+                // progress reader reports the same out_time_us on every
+                // stats tick while FFmpeg is stalled, so publishing every
+                // report floods the replay buffer with identical
+                // snapshots: on a loaded machine a short export takes
+                // tens of seconds, which is hundreds of ticks, and the
+                // buffer evicts the history a reconnecting reader needs
+                // (its replay then resets instead of replaying the gap).
+                // Content-identical snapshots carry no information, so
+                // they are dropped here; every state transition and
+                // every real progress advance still publishes, and the
+                // sequence stays contiguous because it only advances on
+                // a publish.
+                if job.snapshot.state == before.state
+                    && job.snapshot.progress == before.progress
+                    && job.snapshot.encoder == before.encoder
+                    && job.snapshot.disclosure == before.disclosure
+                    && job.snapshot.output == before.output
+                    && job.snapshot.error == before.error
+                {
+                    return;
+                }
                 job.snapshot.sequence += 1;
                 job.snapshot.timestamp = now();
                 job.channel.publish(job.snapshot.clone());

@@ -3,7 +3,13 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const REPLAY_CAPACITY: usize = 128;
+/// Snapshots kept for readers that reconnect. FFmpeg reports progress at
+/// most once per stats tick (10/s with `-stats_period 0.1`), so 512 events
+/// cover roughly 51 seconds of rendering; each snapshot is a few hundred
+/// bytes, so the buffer stays around 150 KB. A reader that polls
+/// continuously never falls behind, and a reader that disconnects briefly
+/// can replay the whole gap instead of hitting `reset`.
+pub const REPLAY_CAPACITY: usize = 512;
 pub const MAX_CONCURRENT_READERS: usize = 8;
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,22 +102,29 @@ mod tests {
     #[test]
     fn bounded_replay_reset_and_duplicate_cursor() {
         let mut channel = ProgressChannel::new(event(1));
-        for sequence in 2..=200 {
+        // Publish past the buffer so the oldest events are evicted; the
+        // counts below are relative to REPLAY_CAPACITY, not the old 128.
+        let total = REPLAY_CAPACITY + 88;
+        for sequence in 2..=total as u64 {
             channel.publish(event(sequence));
         }
         assert_eq!(channel.events.len(), REPLAY_CAPACITY);
         let reset = channel.replay(Some(1)).unwrap();
         assert!(reset.reset);
         assert_eq!(reset.events.len(), 1);
-        assert_eq!(reset.events[0].sequence, 200);
-        let replay = channel.replay(Some(198)).unwrap();
+        assert_eq!(reset.events[0].sequence, total as u64);
+        let replay = channel.replay(Some(total as u64 - 2)).unwrap();
         assert!(!replay.reset);
         assert_eq!(
             replay.events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
-            vec![199, 200]
+            vec![total as u64 - 1, total as u64]
         );
-        assert!(channel.replay(Some(200)).unwrap().events.is_empty());
-        assert!(channel.replay(Some(201)).is_err());
+        assert!(channel
+            .replay(Some(total as u64))
+            .unwrap()
+            .events
+            .is_empty());
+        assert!(channel.replay(Some(total as u64 + 1)).is_err());
     }
     #[test]
     fn reader_limit_releases_on_disconnect() {
